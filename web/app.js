@@ -32970,7 +32970,8 @@
       attachSelection: true,
       attachDiff: false,
       agentRepairRounds: 3,
-      agentMaxSteps: 50
+      agentMaxSteps: 50,
+      lsp: true
     },
     JSON.parse(localStorage.getItem("ghostide-settings") || "{}")
   );
@@ -33161,6 +33162,18 @@
       wsComp.of(wsExt()),
       diagComp.of(diagExt()),
       foldComp.of(foldExt()),
+      /* Desktop Cycle 2 (D4): LSP hover, completion and
+         go-to-definition (F12). The three factories are
+         hoisted function declarations further down (the
+         TDZ rule): constructing the extensions here only
+         stores the references; they run on user input,
+         long after the module has fully loaded. */
+      lspHoverExt(),
+      lspCompletionExt(),
+      keymap.of([{ key: "F12", run: (v) => {
+        lspGoToDefinition(v);
+        return true;
+      } }]),
       keymap.of(foldKeymap),
       EditorView.updateListener.of((u) => {
         if (u.selectionSet || u.docChanged) {
@@ -33195,6 +33208,7 @@
           }
           if (currentFile) queueDraftSave();
           if (currentFile) queueDiagnostics();
+          if (currentFile) queueLspChange();
           if (currentFile) queueAutosave();
         }
       })
@@ -33593,6 +33607,7 @@
     if (p === splitFile) closeSplit();
     const isDirty = p === currentFile ? dirty : !!tabDirty.get(p);
     if (isDirty && !confirm("Close " + p + " with unsaved changes?")) return;
+    lspCloseFile(p);
     tabOrder.splice(i2, 1);
     closedStack.push(p);
     tabStates.delete(p);
@@ -33635,6 +33650,7 @@
     stashTab();
     if (tabStates.has(path)) {
       activateTab(path);
+      lspOpenFile(path, tabStates.get(path).doc.toString());
       maybeDataView(path, null);
       return;
     }
@@ -33653,6 +33669,7 @@
     tabDirty.set(path, false);
     pairNoteOpened(path, d.content);
     activateTab(path);
+    lspOpenFile(path, d.content);
     maybeDataView(path, d.content);
     checkDraft(path, d.content);
     checkQuiet();
@@ -33759,38 +33776,364 @@
         content: view.state.doc.toString()
       });
       if (path !== currentFile) return;
-      let diags = [];
-      diagProblem = null;
+      syntaxDiags = [];
       if (d && d.ok === false && d.line) {
         const ln = Math.max(
           1,
           Math.min(d.line, view.state.doc.lines)
         );
         const line = view.state.doc.line(ln);
-        diags = [{
+        syntaxDiags = [{
           from: line.from,
           to: line.to,
           severity: "error",
           message: d.message || "syntax problem"
         }];
-        diagProblem = {
-          line: ln,
-          message: d.message || "syntax problem"
-        };
       }
-      view.dispatch(setDiagnostics(view.state, diags));
-      if (chip) {
-        if (diagProblem) {
-          chip.textContent = "\u26A0 line " + diagProblem.line;
-          chip.title = diagProblem.message;
-          chip.classList.remove("hidden");
-        } else {
-          chip.classList.add("hidden");
-        }
+      applyDiagnostics();
+    } catch (e) {
+    }
+  }
+  var syntaxDiags = [];
+  var lspDiagsByPath = {};
+  var lspOpenPaths = /* @__PURE__ */ new Set();
+  var lspChangeTimer = null;
+  var LSP_EXTS = {
+    ".py": "python",
+    ".js": "typescript",
+    ".mjs": "typescript",
+    ".cjs": "typescript",
+    ".jsx": "typescript",
+    ".ts": "typescript",
+    ".mts": "typescript",
+    ".cts": "typescript",
+    ".tsx": "typescript"
+  };
+  var LSP_KINDS = {
+    1: "text",
+    2: "method",
+    3: "function",
+    4: "function",
+    5: "property",
+    6: "variable",
+    7: "class",
+    8: "interface",
+    9: "namespace",
+    10: "property",
+    11: "variable",
+    13: "variable",
+    14: "keyword",
+    15: "snippet",
+    17: "file",
+    18: "text",
+    21: "variable",
+    22: "class"
+  };
+  var LSP_SEVERITIES = {
+    1: "error",
+    2: "warning",
+    3: "info",
+    4: "hint"
+  };
+  function lspLangFor(path) {
+    const m = /\.(\w+)$/.exec(path || "");
+    return m ? LSP_EXTS["." + m[1].toLowerCase()] || null : null;
+  }
+  function lspEnabled() {
+    return settings.lsp !== false;
+  }
+  function applyDiagnostics() {
+    const chip = $("diagChip");
+    if (!currentFile) return;
+    if (settings.diag === false) {
+      view.dispatch(setDiagnostics(view.state, []));
+      diagProblem = null;
+      if (chip) chip.classList.add("hidden");
+      return;
+    }
+    const doc2 = view.state.doc;
+    const out = syntaxDiags.slice();
+    for (const d of lspDiagsByPath[currentFile] || []) {
+      try {
+        const s = d.range.start, e = d.range.end;
+        const sl = Math.min(
+          Math.max(1, s.line + 1),
+          doc2.lines
+        );
+        const el = Math.min(
+          Math.max(1, e.line + 1),
+          doc2.lines
+        );
+        const from = Math.min(
+          doc2.line(sl).from + s.character,
+          doc2.line(sl).to
+        );
+        const to = Math.max(from, Math.min(
+          doc2.line(el).from + e.character,
+          doc2.line(el).to
+        ));
+        out.push({
+          from,
+          to,
+          severity: LSP_SEVERITIES[d.severity] || "error",
+          message: (d.source ? d.source + ": " : "") + (d.message || "problem")
+        });
+      } catch (err) {
+      }
+    }
+    view.dispatch(setDiagnostics(view.state, out));
+    if (chip) {
+      if (out.length) {
+        const first = out[0];
+        const ln = doc2.lineAt(
+          Math.min(first.from, doc2.length)
+        ).number;
+        diagProblem = { line: ln, message: first.message };
+        chip.textContent = out.length > 1 ? "\u26A0 " + out.length + " problems" : "\u26A0 line " + ln;
+        chip.title = first.message;
+        chip.classList.remove("hidden");
+      } else {
+        diagProblem = null;
+        chip.classList.add("hidden");
+      }
+    }
+  }
+  async function lspOpenFile(path, content2) {
+    if (!lspEnabled() || !lspLangFor(path) || lspOpenPaths.has(path)) return;
+    lspOpenPaths.add(path);
+    try {
+      await postJson(
+        "/api/lsp/open",
+        { path, content: content2 }
+      );
+      lspFetchDiagnostics(path);
+    } catch (e) {
+    }
+    lspRefreshStatus();
+  }
+  function queueLspChange() {
+    if (!lspEnabled() || !currentFile || !lspOpenPaths.has(currentFile)) return;
+    clearTimeout(lspChangeTimer);
+    lspChangeTimer = setTimeout(async () => {
+      const path = currentFile;
+      if (!path || !lspOpenPaths.has(path)) return;
+      try {
+        await postJson("/api/lsp/change", {
+          path,
+          content: view.state.doc.toString()
+        });
+      } catch (e) {
+      }
+      setTimeout(() => lspFetchDiagnostics(path), 500);
+    }, 900);
+  }
+  async function lspFetchDiagnostics(path) {
+    if (!lspEnabled() || !lspLangFor(path)) return;
+    try {
+      const d = await getJson("/api/lsp/diagnostics?path=" + encodeURIComponent(path));
+      if (d && d.files) {
+        lspDiagsByPath[path] = d.files[path] || [];
+        if (path === currentFile) applyDiagnostics();
       }
     } catch (e) {
     }
   }
+  function lspDidSave(path) {
+    if (lspEnabled() && lspOpenPaths.has(path))
+      postJson("/api/lsp/save", { path }).catch(() => {
+      });
+  }
+  function lspCloseFile(path) {
+    if (!lspOpenPaths.has(path)) return;
+    lspOpenPaths.delete(path);
+    delete lspDiagsByPath[path];
+    postJson("/api/lsp/close", { path }).catch(() => {
+    });
+  }
+  setInterval(() => {
+    if (currentFile && lspOpenPaths.has(currentFile))
+      lspFetchDiagnostics(currentFile);
+  }, 3e3);
+  function lspWordAt(doc2, pos) {
+    const line = doc2.lineAt(pos);
+    const text = line.text;
+    let a = pos - line.from, b = a;
+    while (a > 0 && /[\w$]/.test(text[a - 1])) a--;
+    while (b < text.length && /[\w$]/.test(text[b])) b++;
+    return { from: line.from + a, to: line.from + b };
+  }
+  function lspHoverExt() {
+    return hoverTooltip(async (viewArg, pos) => {
+      if (!lspEnabled() || !currentFile || !lspLangFor(currentFile)) return null;
+      const path = currentFile;
+      const line = viewArg.state.doc.lineAt(pos);
+      try {
+        const d = await postJson("/api/lsp/hover", {
+          path,
+          line: line.number - 1,
+          character: pos - line.from
+        });
+        if (!d || !d.result || path !== currentFile)
+          return null;
+        const c = d.result.contents;
+        let text = "";
+        if (typeof c === "string") text = c;
+        else if (Array.isArray(c))
+          text = c.map((x) => typeof x === "string" ? x : x && x.value || "").join("\n");
+        else if (c && c.value) text = c.value;
+        if (!text.trim()) return null;
+        const word = lspWordAt(viewArg.state.doc, pos);
+        return {
+          pos,
+          end: word.to,
+          above: true,
+          create() {
+            const dom = document.createElement("div");
+            dom.className = "lsp-hover";
+            dom.textContent = text.slice(0, 2e3);
+            return { dom };
+          }
+        };
+      } catch (e) {
+        return null;
+      }
+    }, { hoverTime: 600 });
+  }
+  function lspCompletionExt() {
+    return autocompletion({
+      override: [lspCompletionSource],
+      maxRenderedOptions: 40
+    });
+  }
+  async function lspCompletionSource(context) {
+    if (!lspEnabled() || !currentFile || !lspLangFor(currentFile)) return null;
+    const word = context.matchBefore(/[\w$]+/);
+    if (!context.explicit && !word) return null;
+    const path = currentFile;
+    const line = context.state.doc.lineAt(context.pos);
+    try {
+      const d = await postJson("/api/lsp/completion", {
+        path,
+        line: line.number - 1,
+        character: context.pos - line.from
+      });
+      if (!d || !d.result || path !== currentFile)
+        return null;
+      const items = Array.isArray(d.result) ? d.result : d.result.items || [];
+      const options = [];
+      for (const it of items.slice(0, 200)) {
+        if (!it || !it.label) continue;
+        const opt = {
+          label: String(it.label),
+          type: LSP_KINDS[it.kind] || "text"
+        };
+        if (it.detail)
+          opt.detail = String(it.detail).slice(0, 80);
+        const insert2 = it.textEdit && it.textEdit.newText || it.insertText || it.label;
+        if (insert2 !== it.label) opt.apply = String(insert2);
+        options.push(opt);
+      }
+      if (!options.length) return null;
+      return {
+        from: word ? word.from : context.pos,
+        options,
+        validFor: /^[\w$]*$/
+      };
+    } catch (e) {
+      return null;
+    }
+  }
+  function lspJumpTo(loc) {
+    const doc2 = view.state.doc;
+    const ln = Math.min(
+      Math.max(1, loc.line + 1),
+      doc2.lines
+    );
+    const lineObj = doc2.line(ln);
+    const anchor = Math.min(
+      lineObj.from + (loc.character || 0),
+      lineObj.to
+    );
+    view.dispatch({
+      selection: { anchor },
+      scrollIntoView: true
+    });
+    view.focus();
+  }
+  async function lspGoToDefinition(viewArg) {
+    if (!lspEnabled() || !currentFile || !lspLangFor(currentFile)) return;
+    const path = currentFile;
+    const pos = viewArg.state.selection.main.head;
+    const line = viewArg.state.doc.lineAt(pos);
+    try {
+      const d = await postJson("/api/lsp/definition", {
+        path,
+        line: line.number - 1,
+        character: pos - line.from
+      });
+      const locs = d && d.locations || [];
+      if (!locs.length) {
+        setSaveState("no definition found");
+        return;
+      }
+      const loc = locs[0];
+      if (loc.path === path) lspJumpTo(loc);
+      else {
+        await openFile(loc.path);
+        lspJumpTo(loc);
+      }
+    } catch (e) {
+    }
+  }
+  async function lspRefreshStatus() {
+    const chip = $("lspChip");
+    if (!chip) return;
+    if (!lspEnabled()) {
+      chip.classList.add("hidden");
+      return;
+    }
+    try {
+      const d = await getJson("/api/lsp/status");
+      const parts = [];
+      let label = "LSP";
+      for (const key of ["python", "typescript"]) {
+        const s = d.servers && d.servers[key];
+        if (!s) continue;
+        parts.push(s.server + ": " + s.state + (s.detail ? " (" + s.detail + ")" : ""));
+        if (s.state === "ready") label = "LSP \u2713";
+        else if (s.state === "installing" && label === "LSP") label = "LSP installing\u2026";
+        else if ((s.state === "crashed" || s.state === "install-failed") && label !== "LSP installing\u2026")
+          label = "LSP \u26A0";
+      }
+      chip.textContent = label;
+      chip.title = "Language servers\n" + parts.join("\n") + "\nClick to install or restart a server that needs it.";
+      chip.classList.remove("hidden");
+    } catch (e) {
+      chip.classList.add("hidden");
+    }
+  }
+  async function lspChipAction() {
+    try {
+      const d = await getJson("/api/lsp/status");
+      for (const key of ["python", "typescript"]) {
+        const s = d.servers && d.servers[key];
+        if (!s) continue;
+        if (s.state === "not-installed" || s.state === "install-failed")
+          await postJson(
+            "/api/lsp/install",
+            { language: key }
+          );
+        else if (s.state === "crashed")
+          await postJson(
+            "/api/lsp/restart",
+            { language: key }
+          );
+      }
+    } catch (e) {
+    }
+    setTimeout(lspRefreshStatus, 600);
+  }
+  setInterval(lspRefreshStatus, 1e4);
   async function saveFile() {
     if (!currentFile) return;
     if (settings.trimOnSave) {
@@ -33816,6 +34159,7 @@
       })
     });
     pairNoteSaved();
+    lspDidSave(currentFile);
     dirty = false;
     tabDirty.set(currentFile, false);
     renderTabs();
@@ -37598,6 +37942,26 @@
     diagChipBtn.onclick = () => {
       if (diagProblem) jumpToLine(diagProblem.line);
     };
+  $("setLsp").checked = settings.lsp !== false;
+  $("setLsp").onchange = (e) => {
+    settings.lsp = e.target.checked;
+    saveSettings();
+    if (!settings.lsp) {
+      lspDiagsByPath = {};
+      applyDiagnostics();
+      const chip = $("lspChip");
+      if (chip) chip.classList.add("hidden");
+    } else {
+      if (currentFile)
+        lspOpenFile(currentFile, view.state.doc.toString());
+      lspRefreshStatus();
+    }
+  };
+  var lspChipBtn = $("lspChip");
+  if (lspChipBtn) lspChipBtn.onclick = () => {
+    lspChipAction();
+  };
+  lspRefreshStatus();
   $("setFold").checked = settings.fold !== false;
   $("setFold").onchange = (e) => {
     settings.fold = e.target.checked;

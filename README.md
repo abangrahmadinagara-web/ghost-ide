@@ -134,6 +134,25 @@ served ungated by design.
   `.ghostide/AGENTS.md` override) is folded into the
   agent's system context, and Settings shows which
   instruction files are loaded.
+- **Language servers / LSP** (desktop, v3.12.0): hover,
+  go to definition (F12), completions and document
+  symbols, with language-server diagnostics merged
+  into the editor next to the built-in syntax check.
+  Python is served by **jedi-language-server** (Jedi),
+  installed on first use as pinned, hash-checked
+  wheels into a venv in the app data folder; nothing
+  is installed globally. Be aware of the honest limit:
+  Jedi's diagnostics are syntax-level, not the type
+  errors Pyright would report (Pyright needs Node and
+  may be added for machines that have it).
+  TypeScript/JavaScript is served by
+  **typescript-language-server**, which needs Node.js
+  and npm on the machine; without them the LSP status
+  chip in the status bar says exactly that instead of
+  failing quietly. Language servers are spawned
+  processes, so they never start for an untrusted
+  workspace, and they stop when the IDE does. Turn the
+  whole thing off in Settings ("Language servers").
 
 ## How it is proven
 
@@ -166,8 +185,10 @@ what — see `docs/TESTING.md` in the Android repo.
 - `ghost_paths.py`, `updater.py`, `workspace_trust.py` —
   app-data paths + portable mode, the packaged-app
   updater, and workspace trust + AGENTS.md (Desktop
-  Cycle 1); `tests/` holds their unit and integration
-  tests (`python3 -m unittest discover -s tests`)
+  Cycle 1); `lsp_manager.py` is the language server
+  manager (Desktop Cycle 2); `tests/` holds their unit
+  and integration tests
+  (`python3 -m unittest discover -s tests`)
 - `debug_bridge.py` — the debugger bridge (bdb over stdio)
 - `web/` — the frontend (CodeMirror 6, built with esbuild)
 - `tools/` — the harness suite, probes, and bundle gates

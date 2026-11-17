@@ -28,7 +28,7 @@ WORKSPACE = Path(os.environ.get(
     "GHOST_IDE_WORKSPACE", ROOT / "playground")).resolve()
 PORT = int(os.environ.get("GHOST_IDE_PORT", "5173"))
 HOST = os.environ.get("GHOST_IDE_HOST", "127.0.0.1")
-APP_VERSION = "3.11.0"
+APP_VERSION = "3.12.0"
 FROZEN = getattr(sys, "frozen", False)
 
 # Desktop Cycle 1 (v3.11.0): portable mode, the desktop
@@ -43,6 +43,7 @@ if str(ROOT) not in sys.path:
     # frozen, or imported by the probe suites.
     sys.path.insert(0, str(ROOT))
 import ghost_paths
+import lsp_manager as _lsp_mod
 import updater as _updater_mod
 import workspace_trust as _trust_mod
 
@@ -76,6 +77,15 @@ TRUST_EXEC_ROUTES = frozenset({
     "/api/eco/run", "/api/eco/toolrun",
     "/api/ghostre/run", "/api/rea/run",
     "/api/verify/run", "/api/refactor",
+    # D4 (Desktop Cycle 2): LSP routes spawn and drive
+    # language server processes, so they sit behind the
+    # same trust gate. The read-only GETs (status,
+    # diagnostics) spawn nothing and stay open.
+    "/api/lsp/open", "/api/lsp/change", "/api/lsp/close",
+    "/api/lsp/save", "/api/lsp/hover",
+    "/api/lsp/definition", "/api/lsp/completion",
+    "/api/lsp/symbols", "/api/lsp/restart",
+    "/api/lsp/install",
 })
 
 
@@ -98,6 +108,58 @@ def get_updater():
             app_dir=APP_BASE, frozen=FROZEN,
             manifest_url=UPDATE_MANIFEST_URL)
     return _UPDATER
+
+
+_LSP = None
+
+
+def get_lsp():
+    """D4: the language server manager. Follows the
+    live WORKSPACE global and the trust store, so a
+    workspace switch or a trust decision takes effect
+    without rebuilding it."""
+    global _LSP
+    if _LSP is None:
+        _LSP = _lsp_mod.LspManager(
+            DATA_DIR,
+            workspace_fn=lambda: WORKSPACE,
+            trusted_fn=workspace_trusted,
+            python_cmd=py_cmd)
+    return _LSP
+
+
+def _lsp_locations(result):
+    """Normalise an LSP definition result (Location,
+    Location[] or LocationLink[]) into workspace-relative
+    jumps the UI can act on directly."""
+    if not result:
+        return []
+    items = result if isinstance(result, list) else [result]
+    out = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        uri = it.get("uri") or it.get("targetUri") or ""
+        rng = it.get("range") or it.get("targetSelectionRange") \
+            or it.get("targetRange") or {}
+        start = rng.get("start") or {}
+        end = rng.get("end") or start
+        p = _lsp_mod.uri_to_path(uri)
+        if p is None:
+            continue
+        try:
+            rel = str(Path(p).relative_to(WORKSPACE))
+        except ValueError:
+            rel = p
+        out.append({
+            "path": rel, "uri": uri,
+            "line": int(start.get("line", 0)),
+            "character": int(start.get("character", 0)),
+            "endLine": int(end.get("line",
+                                   start.get("line", 0))),
+            "endCharacter": int(end.get(
+                "character", start.get("character", 0)))})
+    return out
 UPDATE_URL = os.environ.get(
     "GHOST_IDE_UPDATE_URL",
     "https://raw.githubusercontent.com/littlestjames82-sys"
@@ -4727,6 +4789,72 @@ class Handler(SimpleHTTPRequestHandler):
             raise ValueError("request body truncated")
         return json.loads(raw_body or b"{}")
 
+    def _lsp_post(self, action):
+        """D4: one place for the /api/lsp/* POST routes,
+        so the error shape stays consistent: an honest
+        status payload for installing / unavailable /
+        crashed, 403 for untrusted, 400 for bad input."""
+        try:
+            data = self.read_json()
+            mgr = get_lsp()
+            rel = str(data.get("path") or "")
+            if action in ("open", "change", "close", "save",
+                          "hover", "definition", "completion",
+                          "symbols"):
+                if not rel:
+                    raise ValueError("path is required")
+                safe_path(rel)  # must stay in the workspace
+            if action == "open":
+                return self.send_json(mgr.open_document(
+                    rel, str(data.get("content") or "")))
+            if action == "change":
+                return self.send_json(mgr.change_document(
+                    rel, str(data.get("content") or "")))
+            if action == "close":
+                return self.send_json(mgr.close_document(rel))
+            if action == "save":
+                return self.send_json(mgr.save_document(rel))
+            if action == "hover":
+                return self.send_json({"result": mgr.hover(
+                    rel, data.get("line", 0),
+                    data.get("character", 0))})
+            if action == "definition":
+                raw = mgr.definition(
+                    rel, data.get("line", 0),
+                    data.get("character", 0))
+                return self.send_json(
+                    {"locations": _lsp_locations(raw)})
+            if action == "completion":
+                return self.send_json({"result": mgr.completion(
+                    rel, data.get("line", 0),
+                    data.get("character", 0))})
+            if action == "symbols":
+                return self.send_json({"result":
+                                       mgr.document_symbols(rel)})
+            if action == "restart":
+                key = str(data.get("language") or "")
+                if key not in _lsp_mod.SERVER_NAMES:
+                    raise ValueError("unknown language: " + key)
+                return self.send_json(mgr.restart(key))
+            if action == "install":
+                key = str(data.get("language") or "")
+                if key not in _lsp_mod.SERVER_NAMES:
+                    raise ValueError("unknown language: " + key)
+                return self.send_json(mgr.install(key))
+            raise ValueError("unknown LSP action: " + action)
+        except _lsp_mod.LspTrustError as e:
+            return self.send_json(
+                {"error": str(e), "code": e.code}, status=403)
+        except _lsp_mod.LspError as e:
+            status = 503 if e.code in (
+                "lsp-unavailable", "lsp-installing",
+                "lsp-crashed") else 400
+            return self.send_json(
+                {"error": str(e), "code": e.code,
+                 "status": get_lsp().status()}, status=status)
+        except ValueError as e:
+            return self.send_json({"error": str(e)}, status=400)
+
     def proxy(self, path, payload, stream=False):
         """Forward a JSON POST to llama.cpp and relay the response."""
         conn = http.client.HTTPConnection(
@@ -4850,6 +4978,7 @@ class Handler(SimpleHTTPRequestHandler):
                      "modelName": MODEL_NAME, "version": APP_VERSION,
                      "pairRequired": True,
                      "backupFormats": [1, 2],
+                     "lsp": get_lsp().status_summary(),
                      "portable": PORTABLE,
                      "trusted": workspace_trusted(),
                      "workspace": str(WORKSPACE)})
@@ -5106,6 +5235,18 @@ class Handler(SimpleHTTPRequestHandler):
                     "files": [{"rel": f["rel"],
                                "chars": f["chars"]}
                               for f in files]})
+            if parsed.path == "/api/lsp/status":
+                # D4: per-language server state. Read-only:
+                # asking never spawns or installs anything.
+                return self.send_json(get_lsp().status())
+            if parsed.path == "/api/lsp/diagnostics":
+                # D4: the diagnostics the language servers
+                # have published, per workspace-relative
+                # path (one file with ?path=, else all).
+                qs = urllib.parse.parse_qs(parsed.query)
+                rel = (qs.get("path") or [None])[0]
+                return self.send_json({
+                    "files": get_lsp().diagnostics(rel)})
             if parsed.path == "/api/update/status":
                 # D3: packaged-app update state (check,
                 # staged download, pending apply/rollback).
@@ -5964,6 +6105,12 @@ class Handler(SimpleHTTPRequestHandler):
                 WORKSPACE = p
                 _term_kill()
                 _repl_kill()
+                # D4: language servers belong to the old
+                # workspace (rootUri, open documents); a
+                # switch restarts them against the new one
+                # on next use.
+                if _LSP is not None:
+                    _LSP.shutdown_all()
                 return self.send_json({
                     "ok": True, "workspace": str(p),
                     "trusted": workspace_trusted()})
@@ -5982,6 +6129,30 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({
                     "ok": True, "workspace": str(WORKSPACE),
                     "trusted": workspace_trusted()})
+            # D4: language server bridge. These routes
+            # are already behind TRUST_EXEC_ROUTES above;
+            # the manager also re-checks trust itself
+            # before starting any process.
+            if parsed.path == "/api/lsp/open":
+                return self._lsp_post("open")
+            if parsed.path == "/api/lsp/change":
+                return self._lsp_post("change")
+            if parsed.path == "/api/lsp/close":
+                return self._lsp_post("close")
+            if parsed.path == "/api/lsp/save":
+                return self._lsp_post("save")
+            if parsed.path == "/api/lsp/hover":
+                return self._lsp_post("hover")
+            if parsed.path == "/api/lsp/definition":
+                return self._lsp_post("definition")
+            if parsed.path == "/api/lsp/completion":
+                return self._lsp_post("completion")
+            if parsed.path == "/api/lsp/symbols":
+                return self._lsp_post("symbols")
+            if parsed.path == "/api/lsp/restart":
+                return self._lsp_post("restart")
+            if parsed.path == "/api/lsp/install":
+                return self._lsp_post("install")
             if parsed.path == "/api/update/download":
                 # D3: download + verify + stage in the
                 # background; the UI polls /api/update/status.
@@ -7429,6 +7600,14 @@ def main():
         servers[-1].serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        # D4: never leave language server processes
+        # behind the IDE.
+        if _LSP is not None:
+            try:
+                _LSP.shutdown_all()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

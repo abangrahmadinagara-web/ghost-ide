@@ -989,3 +989,13 @@ input:focus, select:focus, textarea:focus {
   flex: 1; overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* Desktop Cycle 2 (D4): LSP hover tooltip body. The
+   tooltip frame itself is CodeMirror's; this is just
+   the text block inside it. */
+.lsp-hover {
+  max-width: 480px; max-height: 240px; overflow: auto;
+  padding: 6px 8px; white-space: pre-wrap;
+  font-family: ui-monospace, monospace; font-size: 12px;
+  line-height: 1.45;
+}
