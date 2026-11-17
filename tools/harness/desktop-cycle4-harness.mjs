@@ -24,14 +24,14 @@ let passed = 0, failed = 0;
 const ck = (n, c) => { console.log((c ? "PASS " : "FAIL ") + n); c ? passed++ : failed++; };
 
 /* ---------- static pins ---------- */
-ck("D8 version: desktop train at 3.14.0, phone train untouched",
-   vjson.desktop && vjson.desktop.version === "3.14.0" &&
-   py.includes('APP_VERSION = "3.14.0"') &&
-   vjson.version === "3.14.0" &&
+ck("D8 version: desktop train agreement (3.14.0 at D8), phone train untouched",
+   vjson.desktop && vjson.desktop.version !== "3.10.1" &&
+   py.includes('APP_VERSION = "' + vjson.desktop.version + '"') &&
+   vjson.version === vjson.desktop.version &&
    vjson.latest === "3.10.1" &&
    vjson.android && vjson.android.version === "3.10.1");
-ck("D8 route census re-derived: 178 (168 + 10 MCP routes)",
-   (py.match(/parsed\.path ==/g) || []).length === 178);
+ck("D8 route census re-derived: 183 (168 + 10 MCP routes in D8, +5 embed routes in D5)",
+   (py.match(/parsed\.path ==/g) || []).length === 183);
 ck("D8 server: policy store lives in the workspace .ghostide folder",
    py.includes('def mcp_policy_path():') &&
    py.includes('WORKSPACE / ".ghostide" / "mcp-policy.json"'));
@@ -75,7 +75,7 @@ const app = td + "/app";
 mkdirSync(app + "/web", { recursive: true });
 mkdirSync(app + "/playground", { recursive: true });
 for (const f of ["server.py", "ghost_paths.py", "updater.py",
-    "workspace_trust.py", "lsp_manager.py", "debug_bridge.py",
+    "workspace_trust.py", "lsp_manager.py", "embed_index.py", "debug_bridge.py",
     "VERSION.json"])
   copyFileSync(root + f, app + "/" + f);
 writeFileSync(app + "/web/index.html", "<html></html>");
@@ -129,7 +129,7 @@ try {
   }
   if (!up) throw new Error("server did not come up:\n" + serverLog);
   const health = await call("GET", "/api/health");
-  ck("E2E server reports 3.14.0", health.data.version === "3.14.0");
+  ck("E2E server reports the desktop version", health.data.version === vjson.desktop.version);
 
   const td8 = await call("POST", "/api/mcp/tools", { server: "fx" });
   const tools = Object.fromEntries(

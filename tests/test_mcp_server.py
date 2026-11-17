@@ -353,7 +353,7 @@ class TestMcpServerE2E(unittest.TestCase):
         self.app.mkdir()
         for f in ("server.py", "ghost_paths.py",
                   "updater.py", "workspace_trust.py",
-                  "lsp_manager.py", "debug_bridge.py",
+                  "lsp_manager.py", "embed_index.py", "debug_bridge.py",
                   "VERSION.json"):
             shutil.copy(REPO / f, self.app / f)
         (self.app / "web").mkdir()
@@ -429,7 +429,7 @@ class TestMcpServerE2E(unittest.TestCase):
                     "web": {"url": httpfx.url}}}))
             port = self.start_server(ws)
             st, health = call(port, "GET", "/api/health")
-            self.assertEqual(health["version"], "3.14.0")
+            self.assertEqual(health["version"], "3.15.0")
             self.assertTrue(health["trusted"])
 
             # Tools carry annotations + policy defaults.

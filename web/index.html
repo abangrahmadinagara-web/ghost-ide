@@ -417,6 +417,7 @@ setTimeout(function () {
     <button id="findGo">Find</button>
     <button id="findSemantic" title="Meaning search: plain-English over functions, ranked by concept">🧠 Meaning</button>
     <button id="findIndexed" title="Indexed search: the real GhostIndex FTS5 index over the whole workspace, token-budgeted excerpts">🔎 Indexed</button>
+    <button id="findNeural" title="Neural search: a local embedding model ranks code chunks by meaning (needs the embedding model and a built index)">✦ Neural</button>
     <button id="findReplace">Replace all</button>
     <button id="findClose">Close</button>
   </div>
@@ -1020,6 +1021,10 @@ setTimeout(function () {
   <p class="dim">Desktop AI model (Qwen2.5-Coder-7B, 4.7 GB, optional):
     <span id="setModelDlOut"></span>
     <button id="setModelDlBtn">Download 7B model</button></p>
+  <p class="dim">Neural search model (nomic-embed-text-v1.5, about 139 MB, optional - powers the Find panel's Neural mode and the agent's SEMANTIC action; the lexical Meaning search works without it):
+    <span id="setEmbedDlOut"></span>
+    <button id="setEmbedDlBtn">Download embedding model</button>
+    <button id="setEmbedBuildBtn">Build neural index</button></p>
   <button id="settingsClose">Close</button>
 </div>
 <nav id="viewBar" aria-label="View switcher">

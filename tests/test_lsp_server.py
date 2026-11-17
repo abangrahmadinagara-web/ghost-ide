@@ -85,7 +85,7 @@ class LspServerCase(unittest.TestCase):
         self.app = self.td / "app"
         self.app.mkdir()
         for f in ("server.py", "ghost_paths.py", "updater.py",
-                  "workspace_trust.py", "lsp_manager.py",
+                  "workspace_trust.py", "lsp_manager.py", "embed_index.py",
                   "debug_bridge.py", "VERSION.json"):
             shutil.copy(REPO / f, self.app / f)
         (self.app / "web").mkdir()
@@ -155,7 +155,7 @@ class LspServerCase(unittest.TestCase):
     def test_lsp_round_trip_over_http(self):
         port = self.start_server({})
         st, health = call(port, "GET", "/api/health")
-        self.assertEqual(health["version"], "3.14.0")
+        self.assertEqual(health["version"], "3.15.0")
         self.assertIn("lsp", health)
 
         # Status is read-only: nothing has spawned yet.

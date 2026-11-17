@@ -25,14 +25,14 @@ let passed = 0, failed = 0;
 const ck = (n, c) => { console.log((c ? "PASS " : "FAIL ") + n); c ? passed++ : failed++; };
 
 /* ---------- static pins ---------- */
-ck("D2 version: desktop train moved past 3.13.0 (D8: 3.14.0), phone train untouched",
+ck("D2 version: desktop train moved past 3.13.0, phone train untouched",
    vjson.desktop && vjson.desktop.version !== "3.10.1" &&
    py.includes('APP_VERSION = "' + vjson.desktop.version + '"') &&
    vjson.version === vjson.desktop.version &&
    vjson.latest === "3.10.1" &&
    vjson.android && vjson.android.version === "3.10.1");
-ck("D2 route census re-derived: 168 (166 + 2 run-record routes)",
-   (py.match(/parsed\.path ==/g) || []).length === 178);
+ck("D2 route census re-derived (166 + 2 run-record routes in D2, +10 MCP in D8, +12 LSP in D4, +5 embed in D5 = 183)",
+   (py.match(/parsed\.path ==/g) || []).length === 183);
 ck("D2 server: run records validated, capped, stored as data",
    py.includes('"/api/agent-runs"') &&
    py.includes("AGENT_RUN_MAX_BYTES = 256 * 1024") &&
@@ -145,7 +145,7 @@ const app = td + "/app";
 mkdirSync(app + "/web", { recursive: true });
 mkdirSync(app + "/playground", { recursive: true });
 for (const f of ["server.py", "ghost_paths.py", "updater.py",
-    "workspace_trust.py", "lsp_manager.py", "debug_bridge.py",
+    "workspace_trust.py", "lsp_manager.py", "embed_index.py", "debug_bridge.py",
     "VERSION.json"])
   copyFileSync(root + f, app + "/" + f);
 writeFileSync(app + "/web/index.html", "<html></html>");

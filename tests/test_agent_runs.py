@@ -108,7 +108,7 @@ class AgentRunsCase(unittest.TestCase):
         self.app = self.td / "app"
         self.app.mkdir()
         for f in ("server.py", "ghost_paths.py", "updater.py",
-                  "workspace_trust.py", "lsp_manager.py",
+                  "workspace_trust.py", "lsp_manager.py", "embed_index.py",
                   "debug_bridge.py", "VERSION.json"):
             shutil.copy(REPO / f, self.app / f)
         (self.app / "web").mkdir()

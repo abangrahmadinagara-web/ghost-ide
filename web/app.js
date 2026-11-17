@@ -34265,6 +34265,7 @@
     $("settingsPanel").classList.toggle("hidden");
     refreshModelDl();
     refreshLlamaDl();
+    refreshEmbedDl();
     refreshTrustUI(false);
     refreshUpdateFlow();
   };
@@ -34576,6 +34577,55 @@
       return;
     }
     refreshLlamaDl();
+  };
+  var embedDlTimer = null;
+  async function refreshEmbedDl() {
+    try {
+      const r = await fetch("/api/embed/download");
+      const d = await r.json();
+      const out = $("setEmbedDlOut");
+      const btn = $("setEmbedDlBtn");
+      if (d.downloaded) {
+        out.textContent = "downloaded \u2713 (" + d.path + ")";
+        btn.textContent = "Download again";
+      } else if (d.state === "downloading") {
+        out.textContent = "downloading\u2026 " + Math.round(100 * (d.done || 0) / (d.total || 1)) + "% of about 139 MB";
+        btn.textContent = "Downloading\u2026";
+      } else if (d.state === "verifying") {
+        out.textContent = "verifying checksum\u2026";
+        btn.textContent = "Verifying\u2026";
+      } else if (d.state === "error") {
+        out.textContent = "error: " + d.error;
+        btn.textContent = "Retry download";
+      } else {
+        out.textContent = "not downloaded (goes to " + d.modelsDir + ")";
+        btn.textContent = "Download embedding model";
+      }
+      if (d.state === "downloading" || d.state === "verifying") {
+        if (!embedDlTimer)
+          embedDlTimer = setInterval(refreshEmbedDl, 2e3);
+      } else if (embedDlTimer) {
+        clearInterval(embedDlTimer);
+        embedDlTimer = null;
+      }
+    } catch (e) {
+    }
+  }
+  $("setEmbedDlBtn").onclick = async () => {
+    const d = await postJson("/api/embed/download", {});
+    if (d.error) {
+      alert(d.error);
+      return;
+    }
+    refreshEmbedDl();
+  };
+  $("setEmbedBuildBtn").onclick = async () => {
+    const d = await postJson("/api/embed/build", {});
+    if (d.error) {
+      alert(d.error);
+      return;
+    }
+    alert("Neural index build started. Progress shows in the Find panel's Neural mode and in Settings.");
   };
   function shortModelLabel(modelName) {
     const name2 = String(modelName || "");
@@ -37099,6 +37149,138 @@
     n.textContent = "GhostIndex FTS5: " + d.shown + " of " + d.total_matches + " file(s) shown, excerpts token-budgeted" + (d.capped ? " (capped by " + (d.capped_by || []).join(", ") + ")" : "") + ". Counts are the tool's estimates.";
     box.appendChild(n);
   };
+  var embedPollTimer = null;
+  function embedPollStop() {
+    if (embedPollTimer) {
+      clearInterval(embedPollTimer);
+      embedPollTimer = null;
+    }
+  }
+  function embedPollStart() {
+    if (!embedPollTimer)
+      embedPollTimer = setInterval(refreshFindNeural, 2e3);
+  }
+  async function refreshFindNeural() {
+    const q = $("findQuery").value;
+    const box = $("findResults");
+    let st;
+    try {
+      const r = await fetch("/api/embed/status");
+      st = await r.json();
+    } catch (e) {
+      embedPollStop();
+      box.textContent = "Neural search is unavailable: " + e;
+      return;
+    }
+    const dl = st.model.download || {};
+    if (!st.model.present) {
+      box.textContent = "";
+      const n2 = document.createElement("div");
+      if (dl.state === "downloading") {
+        embedPollStart();
+        n2.textContent = "Downloading the embedding model\u2026 " + Math.round(100 * (dl.done || 0) / (dl.total || 1)) + "% of about 139 MB. Neural search starts when it lands.";
+        box.appendChild(n2);
+        return;
+      }
+      if (dl.state === "verifying") {
+        embedPollStart();
+        n2.textContent = "Verifying the embedding model checksum\u2026";
+        box.appendChild(n2);
+        return;
+      }
+      embedPollStop();
+      n2.textContent = "Neural search needs the embedding model (nomic-embed-text-v1.5, about 139 MB). It runs fully on this machine; nothing is sent anywhere." + (dl.state === "error" ? " Last download error: " + dl.error : "");
+      box.appendChild(n2);
+      const b2 = document.createElement("button");
+      b2.textContent = "Download embedding model";
+      b2.onclick = async () => {
+        const d2 = await postJson("/api/embed/download", {});
+        if (d2.error) {
+          box.textContent = d2.error;
+          return;
+        }
+        refreshFindNeural();
+      };
+      box.appendChild(b2);
+      return;
+    }
+    if (st.build.state === "building") {
+      embedPollStart();
+      box.textContent = "Building the neural index\u2026 " + (st.build.done || 0) + " of " + (st.build.total || 0) + " changed file(s) embedded.";
+      return;
+    }
+    embedPollStop();
+    if (st.build.state === "error") {
+      box.textContent = "The last index build failed: " + st.build.error;
+      return;
+    }
+    if (!st.index.chunks) {
+      box.textContent = "";
+      const n2 = document.createElement("div");
+      n2.textContent = "The embedding model is ready, but this workspace has no neural index yet. Building it embeds every code chunk locally; only changed files are re-embedded on later builds.";
+      box.appendChild(n2);
+      const b2 = document.createElement("button");
+      b2.textContent = "Build index";
+      b2.onclick = async () => {
+        const d2 = await postJson("/api/embed/build", {});
+        if (d2.error) {
+          box.textContent = d2.error;
+          return;
+        }
+        refreshFindNeural();
+      };
+      box.appendChild(b2);
+      return;
+    }
+    if (!q.trim()) {
+      box.textContent = "Type a plain-English description of the code, then tap Neural.";
+      return;
+    }
+    box.textContent = "asking the embedding model\u2026";
+    const d = await postJson(
+      "/api/embed/search",
+      { query: q }
+    );
+    if (d.error) {
+      box.textContent = d.error;
+      return;
+    }
+    if (!d.available) {
+      box.textContent = "Neural search is not ready: " + (d.notice || "unknown reason");
+      return;
+    }
+    box.textContent = "";
+    if (!d.results.length) {
+      box.textContent = "No chunks matched that meaning.";
+      return;
+    }
+    for (const r of d.results) {
+      const row = document.createElement("div");
+      row.className = "findRow";
+      row.textContent = "\u2726 " + r.path + ":" + r.start_line + "  (" + Math.round(r.score * 100) + "%)" + (r.name ? "  " + r.name : "") + "  " + r.excerpt;
+      row.onclick = async () => {
+        await openFile(r.path);
+        jumpToLine(r.start_line);
+      };
+      box.appendChild(row);
+    }
+    const n = document.createElement("div");
+    n.className = "dim";
+    n.textContent = "Neural embeddings (local model): " + st.index.chunks + " chunks over " + st.index.files + " files; scores are cosine similarity.";
+    box.appendChild(n);
+    const b = document.createElement("button");
+    b.textContent = "Refresh index";
+    b.onclick = async () => {
+      const d2 = await postJson("/api/embed/build", {});
+      if (d2.error) {
+        box.textContent = d2.error;
+        return;
+      }
+      refreshFindNeural();
+    };
+    box.appendChild(b);
+  }
+  $("findNeural").onclick = refreshFindNeural;
   $("findReplace").onclick = async () => {
     const q = $("findQuery").value;
     if (!q) return;
@@ -40277,6 +40459,7 @@
     findGo: { en: "Find", es: "Buscar" },
     findSemantic: { en: "\u{1F9E0} Meaning", es: "\u{1F9E0} Significado" },
     findIndexed: { en: "\u{1F50E} Indexed", es: "\u{1F50E} Indexado" },
+    findNeural: { en: "\u2726 Neural", es: "\u2726 Neuronal" },
     findReplace: { en: "Replace all", es: "Reemplazar todo" },
     findClose: { en: "Close", es: "Cerrar" },
     settingsClose: { en: "Close", es: "Cerrar" },
@@ -43986,6 +44169,7 @@
     "replying with exactly ONE action per message:",
     "READ <path> - ask for a file's current content",
     "SEARCH <query> - search the whole workspace for text",
+    "SEMANTIC <query> - search code by meaning with the local neural embedding index (the result says when the lexical meaning search answered instead)",
     "LIST [path] - list workspace files (optionally under a path)",
     "WRITE <path> - on the next line a fenced code block with",
     "  the file's complete new content (whole file, no fragments)",
@@ -44020,7 +44204,7 @@
     "DONE <one-line summary> - the task is complete",
     "ASK <question> - you need the user to decide something",
     "You may BATCH several read-only actions in one reply, one",
-    "per line: READ, SEARCH, LIST, REVERSE, ECO, GIT, TODO,",
+    "per line: READ, SEARCH, SEMANTIC, LIST, REVERSE, ECO, GIT, TODO,",
     "STEP_DONE. Never batch WRITE, EDIT, RUN or DELETE.",
     "Rules: never invent file contents - READ a file before",
     "rewriting it. Keep every WRITE and EDIT syntactically valid.",
@@ -44035,12 +44219,13 @@
     "action per message:",
     "READ <path> - ask for a file's current content",
     "SEARCH <query> - search the whole workspace for text",
+    "SEMANTIC <query> - search code by meaning with the local neural embedding index (the result says when the lexical meaning search answered instead)",
     "LIST [path] - list workspace files",
     "REVERSE <path> - inspect a file or binary with GhostRE",
     "ECO <tool> - run an ecosystem tool (ghostindex, ghostdeps)",
     "GIT status / GIT diff / GIT log / GIT branches / GIT stash / GIT tags - repository state",
     "You may BATCH several read-only actions in one reply, one",
-    "per line: READ, SEARCH, LIST, REVERSE, ECO, GIT, TODO.",
+    "per line: READ, SEARCH, SEMANTIC, LIST, REVERSE, ECO, GIT, TODO.",
     "TODO <text> - add one step of the plan",
     "DONE <one-line summary> - on the following lines, a fenced",
     "  block with the full written plan in markdown",
@@ -44048,6 +44233,17 @@
     "Add each plan step as a TODO as you work it out, then finish",
     "with DONE and the written plan. You have at most " + AGENT_PLAN_MAX_STEPS + " actions."
   ].join("\n");
+  async function semanticForAgent(query) {
+    const d = await postJson("/api/embed/search", { query });
+    if (!d.error && d.available && d.engine === "neural") {
+      const rs2 = (d.results || []).slice(0, 12);
+      return "Semantic results for " + query + " (answered by the neural embedding index):\n" + (rs2.length ? rs2.map((x) => x.path + ":" + x.start_line + " " + (x.name || "") + " " + x.excerpt).join("\n") : "(no matches)");
+    }
+    const note = d.error || d.notice || "the neural index is unavailable";
+    const l = await postJson("/api/semsearch", { query });
+    const rs = (l.results || []).slice(0, 12);
+    return "Semantic results for " + query + " (neural index unavailable: " + note + "; answered by lexical meaning search):\n" + (rs.length ? rs.map((x) => x.path + ":" + x.line + " " + x.name).join("\n") : "(no matches)");
+  }
   function parseAgentAction(reply) {
     const text = reply || "";
     let m = text.match(/^\s*READ\s+(\S+)\s*$/m);
@@ -44081,6 +44277,8 @@
       };
       return { type: "editbad", path: m[1] };
     }
+    m = text.match(/^\s*SEMANTIC\s+(.+)$/m);
+    if (m) return { type: "semantic", query: m[1].trim() };
     m = text.match(/^\s*SEARCH\s+(.+)$/m);
     if (m) return { type: "search", query: m[1].trim() };
     m = text.match(/^\s*LIST(?:\s+(\S+))?\s*$/m);
@@ -44460,6 +44658,7 @@
   var AGENT_BATCHABLE = [
     "read",
     "search",
+    "semantic",
     "list",
     "todo",
     "stepdone",
@@ -44478,6 +44677,8 @@
       return { type: "read", path: m[1] };
     if (m = t2.match(/^SEARCH\s+(.+)$/))
       return { type: "search", query: m[1].trim() };
+    if (m = t2.match(/^SEMANTIC\s+(.+)$/))
+      return { type: "semantic", query: m[1].trim() };
     if (m = t2.match(/^LIST(?:\s+(\S+))?$/))
       return { type: "list", path: m[1] || "" };
     if (m = t2.match(/^TODO\s+(.+)$/))
@@ -44879,6 +45080,9 @@
         const ms = (d.matches || []).slice(0, 20);
         return "Search results for " + a.query + ":\n" + (ms.length ? ms.map((x) => x.path + ":" + x.line + " " + x.text).join("\n") : "(no matches)");
       }
+      if (a.type === "semantic") {
+        return semanticForAgent(a.query);
+      }
       if (a.type === "list") {
         const fr = await fetch("/api/files");
         const fd = await fr.json();
@@ -45250,6 +45454,12 @@
         const ms = (d.matches || []).slice(0, 20);
         addMsg("SYSTEM", "\u{1F50E} SEARCH " + act.query + " - " + ms.length + " match(es)");
         messages.push({ role: "user", content: "Search results for " + act.query + ":\n" + (ms.length ? ms.map((x) => x.path + ":" + x.line + " " + x.text).join("\n") : "(no matches)") });
+      } else if (act.type === "semantic") {
+        addMsg("SYSTEM", "\u2726 SEMANTIC " + act.query);
+        messages.push({
+          role: "user",
+          content: await semanticForAgent(act.query)
+        });
       } else if (act.type === "list") {
         const fr = await fetch("/api/files");
         const fd = await fr.json();
@@ -45646,6 +45856,7 @@
         [
           "read",
           "search",
+          "semantic",
           "list",
           "todo",
           "reverse",
@@ -45672,6 +45883,8 @@
             );
             const ms = (d.matches || []).slice(0, 20);
             parts.push("Search results for " + a.query + ":\n" + (ms.length ? ms.map((x) => x.path + ":" + x.line + " " + x.text).join("\n") : "(no matches)"));
+          } else if (a.type === "semantic") {
+            parts.push(await semanticForAgent(a.query));
           } else if (a.type === "list") {
             const fr = await fetch("/api/files");
             const fd = await fr.json();
@@ -45710,6 +45923,11 @@
         const d = await postJson("/api/search", { query: act.query });
         const ms = (d.matches || []).slice(0, 20);
         messages.push({ role: "user", content: "Search results for " + act.query + ":\n" + (ms.length ? ms.map((x) => x.path + ":" + x.line + " " + x.text).join("\n") : "(no matches)") });
+      } else if (act.type === "semantic") {
+        messages.push({
+          role: "user",
+          content: await semanticForAgent(act.query)
+        });
       } else if (act.type === "list") {
         const fr = await fetch("/api/files");
         const fd = await fr.json();

@@ -28,7 +28,7 @@ WORKSPACE = Path(os.environ.get(
     "GHOST_IDE_WORKSPACE", ROOT / "playground")).resolve()
 PORT = int(os.environ.get("GHOST_IDE_PORT", "5173"))
 HOST = os.environ.get("GHOST_IDE_HOST", "127.0.0.1")
-APP_VERSION = "3.14.0"
+APP_VERSION = "3.15.0"
 FROZEN = getattr(sys, "frozen", False)
 
 # Desktop Cycle 1 (v3.11.0): portable mode, the desktop
@@ -86,6 +86,13 @@ TRUST_EXEC_ROUTES = frozenset({
     "/api/lsp/definition", "/api/lsp/completion",
     "/api/lsp/symbols", "/api/lsp/restart",
     "/api/lsp/install",
+    # D5 (Desktop Cycle 3): an embedding build reads the
+    # whole workspace and a neural search starts the
+    # embedding server process, so both sit behind the
+    # same gate. The status/download GETs and the model
+    # download POST spawn nothing and follow the
+    # /api/model/download precedent (open).
+    "/api/embed/build", "/api/embed/search",
 })
 
 
@@ -1795,6 +1802,405 @@ def _sem_search(q):
     results.sort(key=lambda r: (-r["score"], r["path"],
                                 r["line"]))
     return results[:12]
+
+
+# ---------------- Neural embeddings (Desktop Cycle 3, D5) ----
+# The fourth search layer, additive over GhostIndex FTS5,
+# the symbol index and the lexical meaning search above: a
+# local embedding model turns workspace chunks into vectors
+# (embed_index.py), stored in .ghostide/embeddings.db and
+# ranked by cosine. The engine is a second llama-server in
+# embedding mode on its own port, started on demand and
+# idle-stopped, so the chat model server is never disturbed.
+# Everything degrades honestly: with no model downloaded or
+# no index built, the routes say so, and the agent's
+# SEMANTIC action falls back to the lexical meaning search.
+import embed_index as _embed_mod
+
+EMBED_MODEL = {
+    "id": "nomic-embed-v1.5-q8",
+    "file": "nomic-embed-text-v1.5.Q8_0.gguf",
+    "url": "https://huggingface.co/nomic-ai/"
+           "nomic-embed-text-v1.5-GGUF/resolve/main/"
+           "nomic-embed-text-v1.5.Q8_0.gguf",
+    # Pin provenance: upstream publishes no standalone
+    # checksum file for this GGUF, so, following the
+    # llama.cpp pin precedent, the SHA-256 below was
+    # computed from the real downloaded asset (146,146,432
+    # bytes, fetched from the URL above) and that hash of
+    # the verified file is the pin.
+    "bytes": 146146432,
+    "sha256": "3e24342164b3d94991ba9692fdc0dd08e3fd7362e0a"
+              "acc396a9a5c54a544c3b7",
+    "dim": 768,
+    # nomic-embed-text-v1.5 is trained with task prefixes:
+    # documents and queries embed in different modes.
+    "doc_prefix": "search_document: ",
+    "query_prefix": "search_query: ",
+}
+EMBED_DL_STATE = {"state": "idle", "done": 0, "total": 0,
+                  "error": "", "id": ""}
+EMBED_BUILD_STATE = {"state": "idle", "done": 0, "total": 0,
+                     "error": "", "stats": None, "skipped": 0}
+EMBED_BASE = os.environ.get(
+    "GHOSTIDE_EMBED_BASE", "http://127.0.0.1:8081")
+EMBED_IDLE_SECONDS = 600
+EMBED_MAX_FILES = 2000
+EMBED_SKIP_DIRS = {".git", "node_modules", ".ghostide",
+                   ".ghostide-history", "__pycache__",
+                   ".venv", "venv", "dist", "build"}
+_embed_proc = None
+_embed_last_used = 0.0
+
+
+def _embed_model_path():
+    return MODELS_DIR / EMBED_MODEL["file"]
+
+
+def _embed_model_present():
+    p = _embed_model_path()
+    return p.is_file() \
+        and p.stat().st_size == EMBED_MODEL["bytes"]
+
+
+def _embed_dl_worker():
+    """Background embedding-model download: the chat model
+    worker's discipline - a .part file with resume, an
+    exact-size gate and SHA-256 verification before the
+    file becomes the model. Only ever started from the
+    Settings / Find panel download action, never silently."""
+    import hashlib
+    entry = EMBED_MODEL
+    try:
+        MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        dest = MODELS_DIR / entry["file"]
+        part = MODELS_DIR / (entry["file"] + ".part")
+        have = part.stat().st_size if part.exists() else 0
+        if have > entry["bytes"]:
+            part.unlink()
+            have = 0
+        EMBED_DL_STATE.update({
+            "state": "downloading", "id": entry["id"],
+            "done": have, "total": entry["bytes"],
+            "error": ""})
+        req = urllib.request.Request(entry["url"])
+        if have:
+            req.add_header("Range", "bytes=%d-" % have)
+        with urllib.request.urlopen(req, timeout=60) as r:
+            if have and r.status != 206:
+                have = 0
+            with open(part, "ab" if have else "wb") as f:
+                done = have
+                while True:
+                    chunk = r.read(1 << 20)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    done += len(chunk)
+                    EMBED_DL_STATE["done"] = done
+        if part.stat().st_size != entry["bytes"]:
+            EMBED_DL_STATE.update({
+                "state": "error",
+                "error": "download incomplete - tap Download "
+                         "again to resume"})
+            return
+        EMBED_DL_STATE["state"] = "verifying"
+        h = hashlib.sha256()
+        with open(part, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 22), b""):
+                h.update(chunk)
+        if h.hexdigest() != entry["sha256"]:
+            part.unlink(missing_ok=True)
+            EMBED_DL_STATE.update({
+                "state": "error",
+                "error": "checksum mismatch - the file was "
+                         "deleted; download again"})
+            return
+        part.rename(dest)
+        EMBED_DL_STATE.update({"state": "done",
+                               "done": entry["bytes"]})
+    except Exception as e:
+        EMBED_DL_STATE.update({"state": "error",
+                               "error": str(e)})
+
+
+def _embed_health():
+    try:
+        with urllib.request.urlopen(
+                EMBED_BASE + "/health", timeout=2) as r:
+            return json.load(r).get("status") == "ok"
+    except Exception:
+        return False
+
+
+def _embed_stop():
+    global _embed_proc
+    if _embed_proc and _embed_proc.poll() is None:
+        _embed_proc.terminate()
+        try:
+            _embed_proc.wait(timeout=5)
+        except Exception:
+            _embed_proc.kill()
+    _embed_proc = None
+
+
+def _embed_stop_if_idle():
+    if _embed_proc and _embed_proc.poll() is None \
+            and _embed_last_used \
+            and time.time() - _embed_last_used \
+            > EMBED_IDLE_SECONDS:
+        _embed_stop()
+
+
+def _embed_engine_state():
+    if _embed_health():
+        return "up"
+    if _embed_proc and _embed_proc.poll() is None:
+        return "starting"
+    return "down"
+
+
+def _embed_start():
+    """Start the embedding llama-server on demand: its own
+    process and port, alongside (never instead of) the chat
+    model server. Returns once health answers; raises
+    ValueError with the honest reason when it cannot."""
+    global _embed_proc, _embed_last_used
+    _embed_stop_if_idle()
+    if _embed_health():
+        _embed_last_used = time.time()
+        return
+    if not _embed_model_present():
+        raise ValueError(
+            "the embedding model is not downloaded yet - "
+            "Settings has the download")
+    if not llama_present():
+        raise ValueError(
+            "llama.cpp is not downloaded yet - Settings "
+            "has the download")
+    if _embed_proc is None or _embed_proc.poll() is not None:
+        log = open(ROOT / "embed-server.log", "ab")
+        port = urllib.parse.urlparse(EMBED_BASE).port or 8081
+        _embed_proc = subprocess.Popen(
+            [LLAMA_BIN, "--model", str(_embed_model_path()),
+             "--embedding", "--pooling", "mean",
+             "--host", "127.0.0.1", "--port", str(port),
+             "--ctx-size", "8192", "--threads", "4",
+             "--alias", EMBED_MODEL["id"]],
+            stdout=log, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, start_new_session=True)
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        if _embed_health():
+            _embed_last_used = time.time()
+            return
+        if _embed_proc.poll() is not None:
+            raise ValueError(
+                "the embedding server exited during startup "
+                "- see embed-server.log")
+        time.sleep(0.25)
+    raise ValueError(
+        "the embedding server did not come up in 60 seconds")
+
+
+def _embed_texts(texts, kind):
+    """Embed a batch of texts with the local model. kind is
+    "doc" or "query" and picks the model's task prefix.
+    Texts go to the long-lived server in batches of 32 -
+    never one process spawn per chunk."""
+    global _embed_last_used
+    if not texts:
+        return []
+    prefix = EMBED_MODEL["doc_prefix" if kind == "doc"
+                         else "query_prefix"]
+    _embed_start()
+    out = []
+    for i in range(0, len(texts), 32):
+        batch = [prefix + t for t in texts[i:i + 32]]
+        req = urllib.request.Request(
+            EMBED_BASE + "/v1/embeddings",
+            data=json.dumps({"input": batch}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=300) as r:
+                data = json.load(r)
+        except Exception as e:
+            raise ValueError(
+                "embedding request failed: " + str(e))
+        rows = sorted(data.get("data", []),
+                      key=lambda x: x.get("index", 0))
+        if len(rows) != len(batch):
+            raise ValueError(
+                "embedding server returned %d vectors for "
+                "%d texts" % (len(rows), len(batch)))
+        out.extend(row["embedding"] for row in rows)
+    _embed_last_used = time.time()
+    return out
+
+
+def _embed_collect_files():
+    """Workspace files for the embedding index. The walk
+    prunes VCS, vendor and app-data folders (including
+    .ghostide itself, so the index never indexes its own
+    database), skips dot-folders, binaries and oversize
+    files, and caps the file count. Returns (texts,
+    skipped); skipped counts everything seen but not
+    indexed, so status can report it honestly."""
+    texts = {}
+    skipped = 0
+    for dirpath, dirnames, filenames in os.walk(WORKSPACE):
+        dirnames[:] = sorted(
+            d for d in dirnames
+            if d not in EMBED_SKIP_DIRS
+            and not d.startswith("."))
+        for name in sorted(filenames):
+            p = Path(dirpath) / name
+            rel = str(p.relative_to(WORKSPACE))
+            try:
+                if p.stat().st_size > 512 * 1024:
+                    skipped += 1
+                    continue
+            except Exception:
+                skipped += 1
+                continue
+            if len(texts) >= EMBED_MAX_FILES:
+                skipped += 1
+                continue
+            try:
+                texts[rel] = p.read_text(errors="strict")
+            except Exception:
+                skipped += 1
+    return texts, skipped
+
+
+def _embed_index():
+    return _embed_mod.EmbedIndex(
+        WORKSPACE / ".ghostide" / "embeddings.db",
+        model_id=EMBED_MODEL["id"])
+
+
+def _embed_build_sync():
+    """One index build/refresh pass: re-embeds only files
+    whose content hash moved, purges deleted files.
+    Raises ValueError with an honest reason when the model
+    or the runtime is missing."""
+    if not _embed_model_present():
+        raise ValueError(
+            "the embedding model is not downloaded yet - "
+            "Settings has the download")
+    if not llama_present():
+        raise ValueError(
+            "llama.cpp is not downloaded yet - Settings "
+            "has the download")
+    texts, skipped = _embed_collect_files()
+    symbols_by_path = {}
+    try:
+        for s in _symbol_index()["symbols"]:
+            symbols_by_path.setdefault(
+                s["path"], []).append(s)
+    except Exception:
+        symbols_by_path = {}
+    idx = _embed_index()
+
+    def prog(done, total):
+        EMBED_BUILD_STATE.update(
+            {"done": done, "total": total})
+
+    try:
+        stats = idx.sync(
+            texts, symbols_by_path,
+            lambda ts: _embed_texts(ts, "doc"),
+            progress=prog, now=int(time.time()))
+    finally:
+        idx.close()
+    stats["skipped"] = skipped
+    return stats
+
+
+def _embed_build_worker():
+    try:
+        EMBED_BUILD_STATE.update({
+            "state": "building", "done": 0, "total": 0,
+            "error": "", "stats": None, "skipped": 0})
+        stats = _embed_build_sync()
+        EMBED_BUILD_STATE.update({
+            "state": "done", "stats": stats,
+            "skipped": stats.get("skipped", 0)})
+    except Exception as e:
+        EMBED_BUILD_STATE.update(
+            {"state": "error", "error": str(e)})
+
+
+def embed_status():
+    _embed_stop_if_idle()
+    # Snapshot the build state BEFORE reading the index:
+    # when the snapshot says a build is done, the index
+    # read that follows is guaranteed to be at least that
+    # build's result, so one response never pairs fresh
+    # build stats with a pre-build index.
+    build = dict(EMBED_BUILD_STATE)
+    idx = _embed_index()
+    try:
+        st = idx.stats()
+    finally:
+        idx.close()
+    return {
+        "model": {"id": EMBED_MODEL["id"],
+                  "file": EMBED_MODEL["file"],
+                  "present": _embed_model_present(),
+                  "bytes": EMBED_MODEL["bytes"],
+                  "path": str(_embed_model_path()),
+                  "download": dict(EMBED_DL_STATE)},
+        "engine": _embed_engine_state(),
+        "index": {"exists": st["exists"],
+                  "files": st["files"],
+                  "chunks": st["chunks"],
+                  "updated": st["updated"],
+                  "skipped": build.get("skipped", 0),
+                  "dim": st["dim"]},
+        "build": build,
+        "available": _embed_model_present()
+        and st["chunks"] > 0,
+    }
+
+
+def embed_search(query, limit=10):
+    """Neural search over the workspace index. Returns
+    {results, engine: "neural"} when the layer is live, or
+    {results: [], available: False, code, notice} when it
+    is not, so callers can fall back honestly instead of
+    failing silently."""
+    q = (query or "").strip()
+    if not q:
+        return {"results": [], "available": False,
+                "code": "empty-query",
+                "notice": "empty query"}
+    if not _embed_model_present():
+        return {"results": [], "available": False,
+                "code": "no-model",
+                "notice": "the embedding model is not "
+                          "downloaded yet"}
+    idx = _embed_index()
+    try:
+        st = idx.stats()
+        if st["chunks"] == 0:
+            return {"results": [], "available": False,
+                    "code": "no-index",
+                    "notice": "the neural index is empty - "
+                              "build it from the Find panel"}
+        try:
+            qvec = _embed_texts([q], "query")[0]
+        except ValueError as e:
+            return {"results": [], "available": False,
+                    "code": "engine-error", "notice": str(e)}
+        results = idx.search(qvec, limit)
+    finally:
+        idx.close()
+    for r in results:
+        r["score"] = round(r["score"], 4)
+    return {"results": results, "engine": "neural",
+            "available": True}
 
 
 # ---- Roadmap G28: offline reference docs ----
@@ -6320,6 +6726,18 @@ class Handler(SimpleHTTPRequestHandler):
                     "path": str(_llama_dir()),
                     "bytes": entry.get("bytes", 0),
                     "release": LLAMA_RELEASE})
+            if parsed.path == "/api/embed/status":
+                # Desktop Cycle 3, D5: neural index status -
+                # model presence, engine state, index stats
+                # and build progress (see embed_status).
+                return self.send_json(embed_status())
+            if parsed.path == "/api/embed/download":
+                return self.send_json({
+                    **EMBED_DL_STATE,
+                    "downloaded": _embed_model_present(),
+                    "path": str(_embed_model_path()),
+                    "bytes": EMBED_MODEL["bytes"],
+                    "modelsDir": str(MODELS_DIR)})
             if parsed.path == "/api/model/info":
                 mp = Path(MODEL)
                 return self.send_json({
@@ -6712,6 +7130,25 @@ class Handler(SimpleHTTPRequestHandler):
                     daemon=True).start()
                 return self.send_json({**LLAMA_DL_STATE,
                                        "state": "downloading"})
+            if parsed.path == "/api/embed/download":
+                # Desktop Cycle 3, D5: fetch the embedding
+                # model (on demand only, never silent; the
+                # GET form above reports progress).
+                if _embed_model_present():
+                    return self.send_json(
+                        {**EMBED_DL_STATE,
+                         "downloaded": True})
+                if EMBED_DL_STATE["state"] in (
+                        "downloading", "verifying"):
+                    return self.send_json(
+                        {**EMBED_DL_STATE})
+                import threading
+                threading.Thread(
+                    target=_embed_dl_worker,
+                    daemon=True).start()
+                return self.send_json(
+                    {**EMBED_DL_STATE,
+                     "state": "downloading"})
             if parsed.path == "/api/model/start":
                 return self.send_json(start_model())
             if parsed.path == "/api/agent-runs":
@@ -8044,6 +8481,42 @@ class Handler(SimpleHTTPRequestHandler):
                 q = data.get("query", "")
                 return self.send_json(
                     {"results": _sem_search(q)})
+            if parsed.path == "/api/embed/search":
+                # Desktop Cycle 3, D5: neural embedding
+                # search over the workspace index (see
+                # embed_search). Trust-gated: a search can
+                # start the embedding server process.
+                data = self.read_json()
+                try:
+                    return self.send_json(embed_search(
+                        str(data.get("query") or ""),
+                        data.get("limit")))
+                except ValueError as e:
+                    return self.send_json(
+                        {"error": str(e)}, 400)
+            if parsed.path == "/api/embed/build":
+                # Desktop Cycle 3, D5: build or refresh the
+                # neural index. Trust-gated: a build reads
+                # the whole workspace and spawns the
+                # embedding server. Progress is polled via
+                # GET /api/embed/status.
+                self.read_json()
+                if EMBED_BUILD_STATE["state"] == "building":
+                    return self.send_json(
+                        dict(EMBED_BUILD_STATE))
+                if not _embed_model_present():
+                    return self.send_json(
+                        {"error": "the embedding model is "
+                                  "not downloaded yet - "
+                                  "Settings has the "
+                                  "download"}, 400)
+                import threading
+                threading.Thread(
+                    target=_embed_build_worker,
+                    daemon=True).start()
+                return self.send_json(
+                    {**EMBED_BUILD_STATE,
+                     "state": "building"})
             if parsed.path == "/api/replace":
                 data = self.read_json()
                 q = data.get("query", "")
