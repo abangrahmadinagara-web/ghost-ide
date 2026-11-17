@@ -25,11 +25,11 @@ ck("A3 atomic writes intact both servers",
 ck("A4 canary string absent from both servers' sources",
    !py.includes("sk-canary-12345") &&
    !java.includes("sk-canary-12345"));
-ck("A5 eco pins: gate lists ghostmcp; its source is 0.3.2; stamp e13",
+ck("A5 eco pins: gate lists ghostmcp; its source is 0.4.0 (M1 gate refresh); stamp e13",
    readFileSync(home + "/workspace/ghost-ide/tools/eco_bundle_gate.py", "utf8")
      .includes('"ghostmcp"') &&
    readFileSync(home + "/workspace/ghostmcp/src/ghostmcp/__init__.py", "utf8")
-     .includes('__version__ = "0.3.2"') &&
+     .includes('__version__ = "0.4.0"') &&
    java.includes(".ready-e13"));
 console.log(`RESULT ${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

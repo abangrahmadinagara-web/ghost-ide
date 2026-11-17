@@ -26,12 +26,12 @@ let passed = 0, failed = 0;
 const ck = (n, c) => { console.log((c ? "PASS " : "FAIL ") + n); c ? passed++ : failed++; };
 
 /* ---------- static pins ---------- */
-ck("D5 version: desktop train agreement (3.15.0 at D5), phone train untouched",
+ck("D5 version: desktop train agreement (3.15.0 at D5), phone train re-synced at M1",
    vjson.desktop && vjson.desktop.version !== "3.10.1" &&
    py.includes('APP_VERSION = "' + vjson.desktop.version + '"') &&
    vjson.version === vjson.desktop.version &&
-   vjson.latest === "3.10.1" &&
-   vjson.android && vjson.android.version === "3.10.1");
+   vjson.latest === vjson.desktop.version &&
+   vjson.android && vjson.android.version === vjson.desktop.version);
 ck("D5 route census re-derived: 194 (190 + 4 git depth routes in D9)",
    (py.match(/parsed\.path ==/g) || []).length === 194);
 ck("D5 server: model pin is the real nomic asset (size + sha256)",

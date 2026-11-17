@@ -30,9 +30,10 @@ ck("A19 verify rows render via textContent from structured fields",
    Desktop Cycle 1 (v3.11.0) is a DESKTOP-ONLY release:
    VERSION.json went per-platform, and the desktop
    train is "desktop".version (falling back to
-   "version"). The shared "latest" field stays the
-   phone train (3.10.1) until the next Android release
-   re-syncs it; check_versions still gates APK builds
+   "version"). The shared "latest" field stayed the
+   phone train (3.10.1) until Mobile Cycle 1 (M1)
+   re-synced every train to the shared version;
+   check_versions still gates APK builds
    on full agreement, so the divergence is deliberate
    and visible, not a half-bump. */
 ck("A20 versions: server.py and VERSION.json agree",

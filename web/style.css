@@ -1062,3 +1062,67 @@ input:focus, select:focus, textarea:focus {
   font-family: ui-monospace, monospace; font-size: 12px;
   line-height: 1.45;
 }
+
+/* ---------- Mobile Cycle 1 (M1): viewport hardening ----
+   Driven by tools/viewport_gate.py, which renders this
+   bundle in a real browser at phone sizes and fails on
+   overflow. The rules here are the fixes it demanded:
+   wrap what can wrap, shrink what must shrink, and let
+   wide content scroll inside its own container, never
+   the page. Rules that only matter when content does
+   not fit are no-ops at desktop widths. */
+/* Flex children default to min-width auto, which lets
+   one long child push its siblings off the panel. */
+.chat-input textarea { min-width: 0; }
+#inlineAiInput { min-width: 0; }
+.apiRow input, .apiRow select { min-width: 0; }
+.apiCols textarea, .dbQueryRow textarea { min-width: 0; }
+.find-btns { flex-wrap: wrap; }
+.run-head { flex-wrap: wrap; row-gap: 4px; }
+.run-head > span { min-width: 0; }
+.split-head { flex-wrap: wrap; row-gap: 4px; }
+.gitRow > span { min-width: 0; overflow-wrap: anywhere; }
+.modelcard .mc-title { overflow-wrap: anywhere; }
+#chatOpts select, .ctx-toggle select { max-width: 100%; }
+/* A toggle label is checkbox + text + control on one
+   line; a wide select (the agent RUN policy list) used
+   to start mid-line and end past the panel edge. As a
+   wrapping flex row the control drops to its own line
+   when it cannot fit, and can shrink below its
+   intrinsic width instead of spilling. */
+.ctx-toggle {
+  display: flex; align-items: center; gap: 6px;
+  flex-wrap: wrap;
+}
+.ctx-toggle select, .ctx-toggle input[type="search"] {
+  flex: 0 1 auto; min-width: 0; max-width: 100%;
+}
+#conflictPanes {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+#keysTable { table-layout: fixed; }
+#keysTable td { overflow-wrap: break-word; }
+
+@media (max-width: 900px) {
+  /* The editor keeps a usable minimum when the in-flow
+     panes (run, terminal, debug) stack above it. */
+  #editorRow { min-height: 180px; }
+  /* Git remote rows: inputs and buttons wrap inside
+     the drawer instead of pushing past its edge (the
+     3.10.1 bug class, generalised). */
+  .ghBtns {
+    display: flex; flex-wrap: wrap; gap: 6px;
+    align-items: center;
+  }
+  .ghBtns input { flex: 1 1 110px; min-width: 0; }
+  .git-remote > input { width: 100%; margin: 4px 0; }
+  /* Conflict panes stack: three readable columns do
+     not exist at phone width. */
+  #conflictPanes { grid-template-columns: minmax(0, 1fr); }
+  #conflictPanel { top: 56px; }
+  #keysTable td:first-child { white-space: normal; }
+  #statusBar #branchChip, #statusBar #testChip {
+    max-width: 38vw; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap;
+  }
+}

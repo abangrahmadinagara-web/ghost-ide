@@ -3,6 +3,12 @@
  "kind": "changelog",
  "entries": [
   {
+   "version": "3.18.0",
+   "date": "Nov 17, 2026",
+   "goal": "Mobile Cycle 1 M1: viewport-matrix gate + phone layout hardening",
+   "summary": "A repeatable viewport gate now renders the built bundle in a real browser at phone sizes and fails on any overflow or clipped control, and the layout is hardened to pass it: wrapping button rows, stacked conflict panes, one overlay panel at a time on phones. The Android build re-syncs to the shared 3.18.0 bundle (language servers, agent trust layer, MCP polish, neural search, model store, git depth included)."
+  },
+  {
    "version": "3.10.1",
    "date": "Nov 4, 2026",
    "goal": "Hotfix: Git panel commit row clipped on phone-width sidebars",

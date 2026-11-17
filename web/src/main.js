@@ -2217,6 +2217,7 @@ window.addEventListener("pointerup", (e) => {
 });
 function setDrawer(open, mode) {
   if (mode) drawerMode = mode;
+  if (open) closeOverlayPanels(null);
   document.body.classList.toggle("drawer-open", open);
   syncViewBar();
 }
@@ -2252,6 +2253,49 @@ $("viewCode").onclick = () => {
 };
 $("viewChat").onclick = () => setSheet(
   currentSheetStop() === "min" ? "mid" : "min");
+/* Mobile Cycle 1 (M1): one overlay panel at a time on
+   phone widths. Every overlay anchors to the same
+   top-right corner, so two open at once bury each
+   other; opening one closes the rest. Desktop keeps
+   free stacking. A MutationObserver on the panels'
+   hidden class is the single choke point every
+   opener (present and future) flows through. */
+const OVERLAY_PANEL_IDS = [
+  "settingsPanel", "findPanel", "diffPanel",
+  "conflictPanel", "toolsPanel", "todoPanel",
+  "snipPanel", "previewPanel", "quickPanel",
+  "keysPanel", "pluginPanel"];
+function closeOverlayPanels(exceptId) {
+  if (window.innerWidth > 900) return;
+  for (const id of OVERLAY_PANEL_IDS) {
+    if (id === exceptId) continue;
+    const el = document.getElementById(id);
+    if (el && !el.classList.contains("hidden"))
+      el.classList.add("hidden");
+  }
+}
+try {
+  const soloWasHidden = {};
+  const soloObs = new MutationObserver((muts) => {
+    for (const m of muts) {
+      const el = m.target;
+      const hidden = el.classList.contains("hidden");
+      const was = soloWasHidden[el.id];
+      soloWasHidden[el.id] = hidden;
+      if (was === true && !hidden)
+        closeOverlayPanels(el.id);
+    }
+  });
+  for (const id of OVERLAY_PANEL_IDS) {
+    const el = document.getElementById(id);
+    if (el) {
+      soloWasHidden[id] = el.classList.contains("hidden");
+      soloObs.observe(el,
+        { attributes: true, attributeFilter: ["class"] });
+    }
+  }
+} catch (e) { /* observer unavailable: panels stack
+  as they did before M1, nothing breaks */ }
 try {
   let stop = localStorage.getItem("ghostide-sheet");
   if (!stop) {

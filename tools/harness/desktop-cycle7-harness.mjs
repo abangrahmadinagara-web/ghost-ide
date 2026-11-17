@@ -1,4 +1,4 @@
-// Desktop Cycle 3, D9 (v3.17.0): git depth - hunk
+// Desktop Cycle 3, D9 (v3.17.0 at build): git depth - hunk
 // staging + the three-pane conflict editor.
 // Static pins over the shipped sources, an extraction
 // test that runs the client's REAL conflict-block
@@ -27,12 +27,13 @@ let passed = 0, failed = 0;
 const ck = (n, c) => { console.log((c ? "PASS " : "FAIL ") + n); c ? passed++ : failed++; };
 
 /* ---------- static pins ---------- */
-ck("D9 version: desktop train at 3.17.0, phone train untouched",
-   vjson.desktop && vjson.desktop.version === "3.17.0" &&
-   py.includes('APP_VERSION = "3.17.0"') &&
-   vjson.version === "3.17.0" &&
-   vjson.latest === "3.10.1" &&
-   vjson.android && vjson.android.version === "3.10.1");
+const appVer = (py.match(/APP_VERSION = "([^"]+)"/) || [])[1];
+ck("D9 version: all trains agree on the shared version (M1 re-sync)",
+   vjson.desktop && vjson.desktop.version === appVer &&
+   py.includes('APP_VERSION = "' + appVer + '"') &&
+   vjson.version === appVer &&
+   vjson.latest === appVer &&
+   vjson.android && vjson.android.version === appVer);
 ck("D9 route census re-derived: 194 (190 + 4 git depth routes)",
    (py.match(/parsed\.path ==/g) || []).length === 194);
 ck("D9 server: hunk endpoints and the apply discipline",
@@ -206,8 +207,8 @@ try {
   }
   if (!up) throw new Error("server did not come up:\n" + serverLog);
   const health = await call("GET", "/api/health");
-  ck("E2E server reports 3.17.0",
-     health.data.version === "3.17.0");
+  ck("E2E server reports the shared version",
+     health.data.version === appVer);
 
   const h = (await call("GET",
     "/api/git/hunks?path=f.txt&area=worktree")).data;

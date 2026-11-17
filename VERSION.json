@@ -1,13 +1,13 @@
 {
  "android": {
-  "version": "3.10.1"
+  "version": "3.18.0"
  },
  "desktop": {
   "manifest": "https://downloads.ghostdeveloperstudio.com/latest.json",
-  "version": "3.17.0"
+  "version": "3.18.0"
  },
- "latest": "3.10.1",
- "notes": "Desktop 3.17.0 (Desktop Cycle 3, D9): git depth. Hunk staging in the diff view: stage, unstage or discard individual hunks, with a stale-selection guard that re-reads the diff and refuses if it changed since it was loaded. A three-pane conflict editor: base, ours and theirs panes beside an editable result, per-conflict Use ours / Use theirs / Use both buttons, a live conflicts-remaining counter, and save (write + stage) blocked while markers remain unless explicitly overridden; the Git panel banners merge, rebase and cherry-pick state and says when the operation is ready to commit, without ever committing or continuing for you. Desktop 3.16.0 added the model store. Android stays 3.10.1; its next release re-syncs the shared version train.",
+ "latest": "3.18.0",
+ "notes": "Mobile Cycle 1 (M1) at 3.18.0: the Android train re-syncs with the shared bundle. A viewport-matrix gate now loads the built bundle in a real Firefox at phone, landscape and desktop sizes and fails on any panel overflow, clipped control or no-wrap row spill; the layout hardening it drove wraps button rows, stacks the conflict panes on narrow screens, keeps flex children shrinkable, and makes overlay panels mutually exclusive on phone widths so the editor keeps a usable minimum. Desktop 3.17.0 added git depth (hunk staging, three-pane conflict editor); 3.15.0 the neural embeddings index; 3.14.0 MCP polish; 3.12.0 language servers.",
  "url": "https://github.com/littlestjames82-sys/ghost-ide/releases",
- "version": "3.17.0"
+ "version": "3.18.0"
 }

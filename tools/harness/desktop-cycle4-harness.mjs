@@ -24,12 +24,12 @@ let passed = 0, failed = 0;
 const ck = (n, c) => { console.log((c ? "PASS " : "FAIL ") + n); c ? passed++ : failed++; };
 
 /* ---------- static pins ---------- */
-ck("D8 version: desktop train agreement (3.14.0 at D8), phone train untouched",
+ck("D8 version: desktop train agreement (3.14.0 at D8), phone train re-synced at M1",
    vjson.desktop && vjson.desktop.version !== "3.10.1" &&
    py.includes('APP_VERSION = "' + vjson.desktop.version + '"') &&
    vjson.version === vjson.desktop.version &&
-   vjson.latest === "3.10.1" &&
-   vjson.android && vjson.android.version === "3.10.1");
+   vjson.latest === vjson.desktop.version &&
+   vjson.android && vjson.android.version === vjson.desktop.version);
 ck("D8 route census re-derived: 194 (190 + 4 git depth routes in D9)",
    (py.match(/parsed\.path ==/g) || []).length === 194);
 ck("D8 server: policy store lives in the workspace .ghostide folder",

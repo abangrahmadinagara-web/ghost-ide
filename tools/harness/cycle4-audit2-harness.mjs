@@ -22,9 +22,9 @@ ck("A7 canary discipline documented for the new surfaces",
    py.includes('"modelName"') && !py.includes("sk-canary"));
 ck("A8 sink census unchanged at 101 in the built bundle",
    (app.match(/innerHTML/g) || []).length === 101);
-ck("A9 eco pins hold: 29 tools, ghostmcp 0.3.2",
+ck("A9 eco pins hold: 29 tools, ghostmcp 0.4.0 (M1 gate refresh)",
    Object.keys(state.tools).length === 29 &&
-   state.tools.ghostmcp.version === "0.3.2");
+   state.tools.ghostmcp.version === "0.4.0");
 ck("A10 atomic writes intact on both servers",
    (py.match(/os\.replace/g) || []).length >= 2 &&
    java.includes("ATOMIC_MOVE"));

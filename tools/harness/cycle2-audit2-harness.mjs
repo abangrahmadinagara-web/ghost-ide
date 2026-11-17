@@ -37,6 +37,6 @@ ck("A9 bundle pins: 29 tools, versions held",
    // bumped it twice (0.3.1 drop verb, 0.3.2 reaping),
    // each with a fresh GREEN gate, so the pin moves
    // with the gate state.
-   ecoState.tools.ghostmcp.version === "0.3.2");
+   ecoState.tools.ghostmcp.version === "0.4.0"); // M1: pin moved to the gate-measured 0.4.0 (D8 tree)
 console.log(`RESULT ${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

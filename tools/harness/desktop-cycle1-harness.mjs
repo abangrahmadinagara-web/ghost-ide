@@ -28,13 +28,13 @@ ck("C1 portable flag + env honoured, data dir centralised",
    release); the durable claims are server/VERSION.json
    agreement on the desktop train and the phone train
    staying put. Desktop Cycle 2 moved the desktop train
-   to 3.12.0; "latest" and android stay 3.10.1 until the
-   next Android release re-syncs them. */
-ck("C1 version: desktop train agrees, phone train untouched",
+   to 3.12.0; "latest" and android stayed 3.10.1 until Mobile
+   Cycle 1 (M1) re-synced them to the shared train. */
+ck("C1 version: desktop train agrees, phone train re-synced at M1",
    py.includes('APP_VERSION = "' + vjson.desktop.version + '"') &&
    vjson.desktop && vjson.version === vjson.desktop.version &&
-   vjson.latest === "3.10.1" &&
-   vjson.android && vjson.android.version === "3.10.1");
+   vjson.latest === vjson.desktop.version &&
+   vjson.android && vjson.android.version === vjson.desktop.version);
 ck("C1 update check follows the desktop train",
    py.includes('(info.get("desktop") or {})'));
 ck("C1 updater routes present, source runs report-only",

@@ -19,13 +19,13 @@ const ck = (n, c) => { console.log((c ? "PASS " : "FAIL ") + n); c ? passed++ : 
    agreement on the desktop train and the phone train
    staying put - the same fix the Cycle 1 harness got.
    D2 (the agent trust layer) moved the desktop train
-   to 3.13.0; "latest" and android stay 3.10.1 until the
-   next Android release re-syncs them. */
-ck("C2 version: desktop train agrees, phone train untouched",
+   to 3.13.0; "latest" and android stayed 3.10.1 until Mobile
+   Cycle 1 (M1) re-synced them to the shared train. */
+ck("C2 version: desktop train agrees, phone train re-synced at M1",
    py.includes('APP_VERSION = "' + vjson.desktop.version + '"') &&
    vjson.desktop && vjson.version === vjson.desktop.version &&
-   vjson.latest === "3.10.1" &&
-   vjson.android && vjson.android.version === "3.10.1");
+   vjson.latest === vjson.desktop.version &&
+   vjson.android && vjson.android.version === vjson.desktop.version);
 ck("C2 manager exists, wired, follows workspace + trust",
    existsSync(root + "lsp_manager.py") &&
    py.includes("import lsp_manager as _lsp_mod") &&

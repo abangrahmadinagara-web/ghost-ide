@@ -35050,6 +35050,7 @@
   });
   function setDrawer(open, mode) {
     if (mode) drawerMode = mode;
+    if (open) closeOverlayPanels(null);
     document.body.classList.toggle("drawer-open", open);
     syncViewBar();
   }
@@ -35092,6 +35093,52 @@
   $("viewChat").onclick = () => setSheet(
     currentSheetStop() === "min" ? "mid" : "min"
   );
+  var OVERLAY_PANEL_IDS = [
+    "settingsPanel",
+    "findPanel",
+    "diffPanel",
+    "conflictPanel",
+    "toolsPanel",
+    "todoPanel",
+    "snipPanel",
+    "previewPanel",
+    "quickPanel",
+    "keysPanel",
+    "pluginPanel"
+  ];
+  function closeOverlayPanels(exceptId) {
+    if (window.innerWidth > 900) return;
+    for (const id2 of OVERLAY_PANEL_IDS) {
+      if (id2 === exceptId) continue;
+      const el = document.getElementById(id2);
+      if (el && !el.classList.contains("hidden"))
+        el.classList.add("hidden");
+    }
+  }
+  try {
+    const soloWasHidden = {};
+    const soloObs = new MutationObserver((muts) => {
+      for (const m of muts) {
+        const el = m.target;
+        const hidden = el.classList.contains("hidden");
+        const was = soloWasHidden[el.id];
+        soloWasHidden[el.id] = hidden;
+        if (was === true && !hidden)
+          closeOverlayPanels(el.id);
+      }
+    });
+    for (const id2 of OVERLAY_PANEL_IDS) {
+      const el = document.getElementById(id2);
+      if (el) {
+        soloWasHidden[id2] = el.classList.contains("hidden");
+        soloObs.observe(
+          el,
+          { attributes: true, attributeFilter: ["class"] }
+        );
+      }
+    }
+  } catch (e) {
+  }
   try {
     let stop = localStorage.getItem("ghostide-sheet");
     if (!stop) {

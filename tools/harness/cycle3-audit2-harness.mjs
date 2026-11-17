@@ -28,7 +28,7 @@ ck("A8 sink census unchanged (100 lines, 101 occurrences)",
    (src.match(/innerHTML/g) || []).length === 101);
 ck("A9 bundle pins at e13 (29 tools, gated versions)",
    Object.keys(ecoState.tools).length === 29 &&
-   ecoState.tools.ghostmcp.version === "0.3.2" &&
+   ecoState.tools.ghostmcp.version === "0.4.0" && // M1: gate-measured 0.4.0
    ecoState.tools.ghostdata.version === "0.1.1" &&
    !Object.values(ecoState.tools)
      .some((t) => t.tests_failed));

@@ -25,12 +25,12 @@ let passed = 0, failed = 0;
 const ck = (n, c) => { console.log((c ? "PASS " : "FAIL ") + n); c ? passed++ : failed++; };
 
 /* ---------- static pins ---------- */
-ck("D2 version: desktop train moved past 3.13.0, phone train untouched",
+ck("D2 version: desktop train moved past 3.13.0, phone train re-synced at M1",
    vjson.desktop && vjson.desktop.version !== "3.10.1" &&
    py.includes('APP_VERSION = "' + vjson.desktop.version + '"') &&
    vjson.version === vjson.desktop.version &&
-   vjson.latest === "3.10.1" &&
-   vjson.android && vjson.android.version === "3.10.1");
+   vjson.latest === vjson.desktop.version &&
+   vjson.android && vjson.android.version === vjson.desktop.version);
 ck("D2 route census re-derived (166 + 2 run-record routes in D2, +10 MCP in D8, +12 LSP in D4, +5 embed in D5 = 183)",
    (py.match(/parsed\.path ==/g) || []).length === 194);
 ck("D2 server: run records validated, capped, stored as data",
