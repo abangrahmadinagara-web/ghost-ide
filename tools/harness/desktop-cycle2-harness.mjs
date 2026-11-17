@@ -14,9 +14,16 @@ const vjson = JSON.parse(readFileSync(root + "VERSION.json", "utf8"));
 let passed = 0, failed = 0;
 const ck = (n, c) => { console.log((c ? "PASS " : "FAIL ") + n); c ? passed++ : failed++; };
 
-ck("C2 version: desktop train at 3.12.0, phone train untouched",
-   py.includes('APP_VERSION = "3.12.0"') &&
-   vjson.desktop && vjson.desktop.version === "3.12.0" &&
+/* Was a 3.12.0 literal in Cycle 2 (true only that
+   release); the durable claims are server/VERSION.json
+   agreement on the desktop train and the phone train
+   staying put - the same fix the Cycle 1 harness got.
+   D2 (the agent trust layer) moved the desktop train
+   to 3.13.0; "latest" and android stay 3.10.1 until the
+   next Android release re-syncs them. */
+ck("C2 version: desktop train agrees, phone train untouched",
+   py.includes('APP_VERSION = "' + vjson.desktop.version + '"') &&
+   vjson.desktop && vjson.version === vjson.desktop.version &&
    vjson.latest === "3.10.1" &&
    vjson.android && vjson.android.version === "3.10.1");
 ck("C2 manager exists, wired, follows workspace + trust",

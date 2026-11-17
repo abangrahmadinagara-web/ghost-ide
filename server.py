@@ -28,7 +28,7 @@ WORKSPACE = Path(os.environ.get(
     "GHOST_IDE_WORKSPACE", ROOT / "playground")).resolve()
 PORT = int(os.environ.get("GHOST_IDE_PORT", "5173"))
 HOST = os.environ.get("GHOST_IDE_HOST", "127.0.0.1")
-APP_VERSION = "3.12.0"
+APP_VERSION = "3.13.0"
 FROZEN = getattr(sys, "frozen", False)
 
 # Desktop Cycle 1 (v3.11.0): portable mode, the desktop
@@ -95,6 +95,96 @@ def _trust_denied(handler):
                   "agent actions, terminal and MCP tools "
                   "stay off until you trust the folder",
          "code": "workspace-untrusted"}, status=403)
+
+
+# Desktop Cycle 2, D2 (agent trust layer): run records.
+# At the end of a run the client posts one JSON record
+# per run; the server stores it under
+# .ghostide/agent-runs/<id>.json. A record is DATA: it
+# is shape-checked (object, kind, id, size, step count)
+# and stored verbatim, never executed and never
+# interpreted beyond the summary fields the list view
+# reads. Writing one is a plain workspace file write,
+# so - exactly like POST /api/file, which is also not
+# in TRUST_EXEC_ROUTES - it is not trust-gated; the
+# trust gate covers routes that execute code or drive
+# tools, and recording a finished run does neither.
+import re as _agent_run_re
+
+AGENT_RUN_MAX_BYTES = 256 * 1024
+AGENT_RUN_MAX_STEPS = 400
+AGENT_RUN_ID_RE = _agent_run_re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
+
+
+def _agent_runs_dir():
+    return WORKSPACE / ".ghostide" / "agent-runs"
+
+
+def _agent_run_path(run_id):
+    if not AGENT_RUN_ID_RE.match(run_id or "") \
+            or ".." in run_id:
+        raise ValueError("bad run id")
+    return _agent_runs_dir() / (run_id + ".json")
+
+
+def _save_agent_run(data, raw_len):
+    if raw_len > AGENT_RUN_MAX_BYTES:
+        raise ValueError(
+            "run record too large (limit %d bytes)"
+            % AGENT_RUN_MAX_BYTES)
+    if not isinstance(data, dict):
+        raise ValueError("run record must be a JSON object")
+    if data.get("kind") != "ghostide-agent-run":
+        raise ValueError("not a GhostIDE agent run record")
+    run_id = str(data.get("id") or "")
+    p = _agent_run_path(run_id)
+    steps = data.get("steps")
+    if steps is not None and (
+            not isinstance(steps, list)
+            or len(steps) > AGENT_RUN_MAX_STEPS):
+        raise ValueError(
+            "run record steps must be a list of at most %d"
+            % AGENT_RUN_MAX_STEPS)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.parent / (".%s.tmp-%d" % (p.name, os.getpid()))
+    try:
+        tmp.write_text(json.dumps(data, indent=1))
+        os.replace(tmp, p)
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+    return ".ghostide/agent-runs/" + run_id + ".json"
+
+
+def _list_agent_runs():
+    d = _agent_runs_dir()
+    out = []
+    if d.is_dir():
+        for p in sorted(d.glob("*.json")):
+            try:
+                rec = json.loads(p.read_text())
+            except Exception:
+                continue
+            if not isinstance(rec, dict) \
+                    or rec.get("kind") != "ghostide-agent-run":
+                continue
+            out.append({
+                "id": rec.get("id") or p.stem,
+                "task": str(rec.get("task") or "")[:200],
+                "mode": rec.get("mode") or "act",
+                "outcome": rec.get("outcome") or "",
+                "startedAt": rec.get("startedAt") or "",
+                "endedAt": rec.get("endedAt") or "",
+                "files": len(rec.get("filesChanged") or []),
+                "checkpoint": rec.get("checkpoint"),
+                "planPath": rec.get("planPath"),
+            })
+    out.sort(key=lambda r: r["endedAt"] or r["startedAt"],
+             reverse=True)
+    return out[:100]
 
 
 _UPDATER = None
@@ -5225,6 +5315,22 @@ class Handler(SimpleHTTPRequestHandler):
                     "workspace": str(WORKSPACE),
                     "trusted": workspace_trusted(),
                     "decision": TRUST_STORE.decision(WORKSPACE)})
+            if parsed.path == "/api/agent-runs":
+                # D2: list run records, or fetch one with
+                # ?id=<run id>. Records are data; reading
+                # them executes nothing.
+                qs = urllib.parse.parse_qs(parsed.query)
+                rid = (qs.get("id") or [""])[0]
+                if rid:
+                    p = _agent_run_path(rid)
+                    if not p.is_file():
+                        return self.send_json(
+                            {"error": "no such run record"},
+                            status=404)
+                    return self.send_json(
+                        {"record": json.loads(p.read_text())})
+                return self.send_json(
+                    {"runs": _list_agent_runs()})
             if parsed.path == "/api/instructions":
                 # D7: which instruction files are in force
                 # for this workspace (AGENTS.md, with the
@@ -5703,6 +5809,27 @@ class Handler(SimpleHTTPRequestHandler):
                                        "state": "downloading"})
             if parsed.path == "/api/model/start":
                 return self.send_json(start_model())
+            if parsed.path == "/api/agent-runs":
+                # D2: store one run record (data only; see
+                # the note at _save_agent_run). Oversize
+                # bodies are refused before parsing.
+                cls = self.headers.get_all("Content-Length") \
+                    or []
+                raw_len = 0
+                if len(cls) == 1:
+                    try:
+                        raw_len = int(cls[0])
+                    except Exception:
+                        raw_len = 0
+                if raw_len > AGENT_RUN_MAX_BYTES:
+                    return self.send_json(
+                        {"error": "run record too large "
+                                  "(limit %d bytes)"
+                                  % AGENT_RUN_MAX_BYTES},
+                        status=413)
+                data = self.read_json()
+                path = _save_agent_run(data, raw_len)
+                return self.send_json({"ok": True, "path": path})
             if parsed.path == "/api/file":
                 data = self.read_json()
                 p = safe_path(data["path"])
@@ -7069,10 +7196,16 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json(result)
             if parsed.path == "/api/diff-text":
                 # Unified diff of proposed content vs the file on
-                # disk (agent review, G5).
+                # disk (agent review, G5). D2: an explicit
+                # "base" overrides the disk side, so the run
+                # review can diff a checkpoint original
+                # against what is on disk now.
                 data = self.read_json()
                 p = safe_path(data["path"])
-                old = p.read_text() if p.is_file() else ""
+                if data.get("base") is not None:
+                    old = data["base"]
+                else:
+                    old = p.read_text() if p.is_file() else ""
                 new = data.get("content", "")
                 diff = "\n".join(_difflib.unified_diff(
                     old.splitlines(), new.splitlines(),

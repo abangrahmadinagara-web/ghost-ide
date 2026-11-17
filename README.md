@@ -134,6 +134,28 @@ served ungated by design.
   `.ghostide/AGENTS.md` override) is folded into the
   agent's system context, and Settings shows which
   instruction files are loaded.
+- **Agent trust layer** (desktop, v3.13.0): a finished
+  plan is also written to `.ghostide/plans/plan-<time>.md`
+  in the workspace, where it can be opened and edited
+  like any file - acting on the plan re-reads that
+  file, so edits to it change what runs. Each agent
+  run owns **one checkpoint** in
+  `.ghostide/checkpoints/`: the pre-run content of
+  every file the run touches, captured lazily on
+  first touch (files over 512 KB or binary are
+  skipped and named in the review, never silently).
+  After an apply, a **run review** lists what the
+  run changed - modified, created, deleted - with
+  per-file **Keep** (accept, drop the undo point) and
+  **Undo** (restore the pre-run content; created
+  files are removed, deleted files come back), an
+  Undo All, and per-hunk undo in the diff view (a
+  hunk whose text no longer matches the file is
+  refused, not guessed). Every run, plan or act,
+  leaves a **run record** in `.ghostide/agent-runs/`
+  (prompt, plan file, steps, approvals, files
+  changed, checkpoint, outcome), readable over
+  `GET /api/agent-runs`.
 - **Language servers / LSP** (desktop, v3.12.0): hover,
   go to definition (F12), completions and document
   symbols, with language-server diagnostics merged

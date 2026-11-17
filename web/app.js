@@ -43874,6 +43874,197 @@
   }
   window.__ghostParseAgent2 = parseAgent2Action;
   window.__ghostApplyEdit = applyEditPatch;
+  var RUN_CKPT_MAX_CHARS = 512e3;
+  var RUN_RECORD_MAX_STEPS = 400;
+  function agentRunStamp(date) {
+    const d = date || /* @__PURE__ */ new Date();
+    const p = (x) => String(x).padStart(2, "0");
+    return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + "-" + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
+  }
+  function makeAgentRunId(date, rand) {
+    return "run-" + agentRunStamp(date) + "-" + String(rand || "0000").replace(/[^a-z0-9]/gi, "").slice(0, 6);
+  }
+  function runCheckpointPath(runId) {
+    return ".ghostide/checkpoints/ckpt-" + runId + ".json";
+  }
+  function planFilePath(date) {
+    return ".ghostide/plans/plan-" + agentRunStamp(date) + ".md";
+  }
+  function buildPlanFile(task, planText, todos, date) {
+    const steps = normalizeAgentTodos(todos);
+    const lines = [
+      "# GhostIDE plan",
+      "",
+      "Task: " + String(task || "").slice(0, 300),
+      "Created: " + (date || /* @__PURE__ */ new Date()).toISOString(),
+      "",
+      "Steps:"
+    ];
+    if (steps.length)
+      steps.forEach((t2, i2) => lines.push(i2 + 1 + ". " + t2.text));
+    else lines.push("(no steps recorded)");
+    lines.push(
+      "",
+      "---",
+      "",
+      String(planText || "").trim(),
+      ""
+    );
+    return lines.join("\n");
+  }
+  function planBodyFromFile(content2) {
+    const text = String(content2 || "");
+    const lines = text.split("\n");
+    for (let i2 = 0; i2 < lines.length; i2++)
+      if (lines[i2].trim() === "---")
+        return lines.slice(i2 + 1).join("\n").trim();
+    return text.trim();
+  }
+  function splitRunOriginals(originals, deletedPaths) {
+    const del = new Set(deletedPaths || []);
+    const files = {}, deleted = {};
+    for (const [p, c] of Object.entries(originals || {})) {
+      if (del.has(p)) deleted[p] = c;
+      else files[p] = c;
+    }
+    return { files, deleted };
+  }
+  function runChangeKind(path, originals, deletedPaths) {
+    if ((deletedPaths || []).includes(path)) return "deleted";
+    if (originals && path in originals && originals[path] == null) return "created";
+    return "modified";
+  }
+  function parseUnifiedDiff(text) {
+    const hunks = [];
+    let cur2 = null, gotOld = 0, gotNew = 0;
+    for (const line of String(text || "").split("\n")) {
+      const m = line.match(
+        /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/
+      );
+      if (m) {
+        cur2 = {
+          oldStart: +m[1],
+          oldCount: m[2] === void 0 ? 1 : +m[2],
+          newStart: +m[3],
+          newCount: m[4] === void 0 ? 1 : +m[4],
+          lines: []
+        };
+        hunks.push(cur2);
+        gotOld = 0;
+        gotNew = 0;
+        continue;
+      }
+      if (!cur2) continue;
+      if (gotOld >= cur2.oldCount && gotNew >= cur2.newCount) {
+        cur2 = null;
+        continue;
+      }
+      if (line.startsWith("\\")) continue;
+      const t2 = line.charAt(0);
+      if (t2 === " " || t2 === "+" || t2 === "-") {
+        cur2.lines.push({ t: t2, text: line.slice(1) });
+        if (t2 !== "+") gotOld++;
+        if (t2 !== "-") gotNew++;
+      } else if (line === "") {
+        cur2.lines.push({ t: " ", text: "" });
+        gotOld++;
+        gotNew++;
+      }
+    }
+    return hunks;
+  }
+  function reverseUnifiedHunk(content2, hunk) {
+    const lines = String(content2 == null ? "" : content2).split("\n");
+    const newSide = [], oldSide = [];
+    for (const l of hunk.lines) {
+      if (l.t === " " || l.t === "+") newSide.push(l.text);
+      if (l.t === " " || l.t === "-") oldSide.push(l.text);
+    }
+    if (!newSide.length && !oldSide.length)
+      return { ok: false, error: "empty hunk" };
+    const start0 = Math.max(0, (hunk.newStart || 1) - 1);
+    const matches = (at2) => {
+      if (at2 < 0 || at2 + newSide.length > lines.length)
+        return false;
+      for (let i2 = 0; i2 < newSide.length; i2++)
+        if (lines[at2 + i2] !== newSide[i2]) return false;
+      return true;
+    };
+    let at = -1;
+    if (matches(start0)) at = start0;
+    else {
+      for (let d = 1; d <= 80 && at < 0; d++) {
+        if (matches(start0 - d)) at = start0 - d;
+        else if (matches(start0 + d)) at = start0 + d;
+      }
+    }
+    if (at < 0)
+      return {
+        ok: false,
+        error: "this hunk no longer matches the file (it changed since the run) - undo the whole file instead"
+      };
+    const out = lines.slice(0, at).concat(
+      oldSide,
+      lines.slice(at + newSide.length)
+    );
+    return { ok: true, content: out.join("\n") };
+  }
+  function buildRunRecord(f) {
+    f = f || {};
+    const cap = (s, n) => String(s == null ? "" : s).slice(0, n);
+    const steps = (Array.isArray(f.steps) ? f.steps : []).slice(0, RUN_RECORD_MAX_STEPS).map((s) => ({
+      step: (s && s.step) | 0,
+      type: cap(s && s.type, 40),
+      target: cap(s && s.target, 200)
+    }));
+    const approvals = (Array.isArray(f.approvals) ? f.approvals : []).slice(0, 100).map((a) => ({
+      kind: cap(a && a.kind, 20),
+      target: cap(a && a.target, 200),
+      verdict: cap(a && a.verdict, 20)
+    }));
+    const filesChanged = (Array.isArray(f.filesChanged) ? f.filesChanged : []).slice(0, 200).map((c) => ({
+      path: cap(c && c.path, 300),
+      kind: cap(c && c.kind, 20)
+    }));
+    return {
+      kind: "ghostide-agent-run",
+      version: 1,
+      id: cap(f.id, 80),
+      mode: f.mode === "plan" ? "plan" : "act",
+      task: cap(f.task, 500),
+      planPath: f.planPath || null,
+      startedAt: f.startedAt || "",
+      endedAt: f.endedAt || "",
+      outcome: cap(f.outcome, 40),
+      summary: cap(f.summary, 500),
+      steps,
+      approvals,
+      filesChanged,
+      checkpoint: f.checkpoint || null,
+      skipped: (Array.isArray(f.skipped) ? f.skipped : []).slice(0, 100).map((p) => cap(p, 300))
+    };
+  }
+  window.__ghostRunReview = {
+    agentRunStamp,
+    makeAgentRunId,
+    runCheckpointPath,
+    planFilePath,
+    buildPlanFile,
+    planBodyFromFile,
+    splitRunOriginals,
+    runChangeKind,
+    parseUnifiedDiff,
+    reverseUnifiedHunk,
+    buildRunRecord,
+    RUN_CKPT_MAX_CHARS
+  };
+  function postRunRecord(fields) {
+    try {
+      postJson("/api/agent-runs", buildRunRecord(fields)).catch(() => {
+      });
+    } catch (e) {
+    }
+  }
   function agentPolicy() {
     try {
       return localStorage.getItem("ghostide-agent-policy") || "each";
@@ -44247,6 +44438,67 @@
     const deletions = new Set(opts.deletions || []);
     let todos = normalizeAgentTodos(opts.todos || []);
     let checkpoints = [];
+    const runId = makeAgentRunId(
+      /* @__PURE__ */ new Date(),
+      Math.random().toString(36).slice(2, 6)
+    );
+    const runStartedAt = (/* @__PURE__ */ new Date()).toISOString();
+    const runOriginals = {};
+    const runSkipped = [];
+    const runApprovals = [];
+    let runCkptPath = "";
+    async function persistRunCheckpoint() {
+      if (!Object.keys(runOriginals).length && !runSkipped.length) return;
+      const split = splitRunOriginals(
+        runOriginals,
+        [...deletions]
+      );
+      const payload = buildDiskCheckpoint(
+        task,
+        split.files,
+        split.deleted
+      );
+      payload.runId = runId;
+      payload.run = true;
+      payload.skipped = runSkipped.slice();
+      if (!runCkptPath) runCkptPath = runCheckpointPath(runId);
+      const cd = await postJson(
+        "/api/file",
+        {
+          path: runCkptPath,
+          content: JSON.stringify(payload)
+        }
+      );
+      if (cd.error) return;
+      const idx = ckptIndexLoad();
+      const entry = {
+        path: runCkptPath,
+        created: payload.created,
+        task: payload.task,
+        files: Object.keys(runOriginals),
+        run: true
+      };
+      const at = idx.findIndex((x) => x.path === runCkptPath);
+      if (at >= 0) idx[at] = entry;
+      else idx.unshift(entry);
+      ckptIndexSave(idx);
+    }
+    async function captureRunOriginal(path) {
+      if (path in runOriginals || runSkipped.includes(path)) return;
+      let content2 = null;
+      try {
+        const r = await fetch("/api/file?path=" + encodeURIComponent(path));
+        const d = await r.json();
+        if (!d.error) content2 = d.content;
+      } catch (e) {
+      }
+      if (content2 != null && (content2.length > RUN_CKPT_MAX_CHARS || content2.includes("\0"))) {
+        runSkipped.push(path);
+      } else {
+        runOriginals[path] = content2;
+      }
+      await persistRunCheckpoint();
+    }
     const policy = agentPolicy();
     let runAllowAll = policy === "all" || policy === "plan" && !!opts.plan;
     addMsg("YOU", "\u{1F916} " + task + (opts.plan ? "\n(following the approved plan)" : ""));
@@ -44659,6 +44911,7 @@
         addMsg("SYSTEM", "\u{1F5C2} LIST " + (act.path || "(all)") + " - " + names.length + " file(s)");
         messages.push({ role: "user", content: "Files" + (act.path ? " under " + act.path : "") + ":\n" + names.slice(0, 120).join("\n") });
       } else if (act.type === "write") {
+        await captureRunOriginal(act.path);
         staged.set(act.path, act.content);
         deletions.delete(act.path);
         const note = await agentCheckOne(act.path, act.content);
@@ -44666,6 +44919,7 @@
         addMsg("SYSTEM", "\u270F\uFE0F WRITE " + act.path + " (staged - not saved)\n" + note);
         messages.push({ role: "user", content: "Staged " + act.path + ". " + staged.size + " file(s) staged. Automatic check: " + note + " Continue." });
       } else if (act.type === "edit") {
+        await captureRunOriginal(act.path);
         const base2 = await readForAgent(act.path);
         const r = applyEditPatch(base2, act.oldText, act.newText);
         if (!r.ok) {
@@ -44694,17 +44948,28 @@
           if (q.error) {
             messages.push({ role: "user", content: "Queueing that command failed: " + q.error + " Continue without it." });
           } else {
+            runApprovals.push({
+              kind: "run",
+              target: act.command,
+              verdict: "queued"
+            });
             addMsg("SYSTEM", "\u{1F4E5} RUN queued for approval (" + q.id + "): " + act.command);
             messages.push({ role: "user", content: "That command went to the Approve queue (" + q.id + ") and has NOT run. The user decides in Tools > Approve queue. Continue without its output, or finish with DONE." });
           }
           continue;
         }
+        const wasAuto = runAllowAll;
         let verdict = runAllowAll ? "all" : await agentApproveRunUi(act.command);
         if (verdict === "all") runAllowAll = true;
         if (agentStop) {
           outcome = "stopped";
           break;
         }
+        runApprovals.push({
+          kind: "run",
+          target: act.command,
+          verdict: verdict === "deny" ? "denied" : wasAuto ? "auto" : verdict === "all" ? "granted-all" : "granted"
+        });
         if (verdict === "deny") {
           addMsg("SYSTEM", "\u26D4 RUN denied by you: " + act.command);
           messages.push({ role: "user", content: "The user denied that command. Do not retry it; find another way or finish with DONE." });
@@ -44730,11 +44995,17 @@
           if (q.error) {
             messages.push({ role: "user", content: "Queueing that deletion failed: " + q.error + " Continue without it." });
           } else {
+            runApprovals.push({
+              kind: "delete",
+              target: act.path,
+              verdict: "queued"
+            });
             addMsg("SYSTEM", "\u{1F4E5} DELETE queued for approval (" + q.id + "): " + act.path);
             messages.push({ role: "user", content: "Deletion of " + act.path + " went to the Approve queue (" + q.id + ") and has NOT happened. The user decides in Tools > Approve queue. Continue." });
           }
           continue;
         }
+        await captureRunOriginal(act.path);
         staged.delete(act.path);
         deletions.add(act.path);
         snapshot("DELETE " + act.path, step);
@@ -44783,6 +45054,11 @@
           if (q.error) {
             messages.push({ role: "user", content: "Queueing that MCP call failed: " + q.error + " Continue without it." });
           } else {
+            runApprovals.push({
+              kind: "mcp",
+              target: act.server + "." + act.tool,
+              verdict: "queued"
+            });
             addMsg("SYSTEM", "\u{1F4E5} MCP call queued for approval (" + q.id + "): " + act.server + "." + act.tool);
             messages.push({ role: "user", content: "That MCP call went to the Approve queue (" + q.id + ") and has NOT run. The user decides in Tools > Approve queue. Continue without its result, or finish with DONE." });
           }
@@ -44793,6 +45069,11 @@
             outcome = "stopped";
             break;
           }
+          runApprovals.push({
+            kind: "mcp",
+            target: act.server + "." + act.tool,
+            verdict: verdict === "deny" ? "denied" : verdict === "all" ? "granted-all" : "granted"
+          });
           if (verdict === "deny") {
             addMsg("SYSTEM", "\u26D4 MCP call denied by you: " + act.server + "." + act.tool);
             messages.push({ role: "user", content: "The user denied that MCP call. Do not retry it; find another way or finish with DONE." });
@@ -44804,6 +45085,11 @@
             });
           }
         } else {
+          runApprovals.push({
+            kind: "mcp",
+            target: act.server + "." + act.tool,
+            verdict: "auto"
+          });
           const t2 = await agentToolText(act);
           messages.push({
             role: "user",
@@ -44858,6 +45144,30 @@
         target: repairs + " repair round(s)"
       });
     saveTrail(task, trail, (Date.now() - agentT0) / 1e3);
+    const runFilesChanged = [];
+    for (const p of staged.keys())
+      runFilesChanged.push({
+        path: p,
+        kind: runChangeKind(p, runOriginals, [...deletions])
+      });
+    for (const p of deletions)
+      if (!staged.has(p))
+        runFilesChanged.push({ path: p, kind: "deleted" });
+    postRunRecord({
+      id: runId,
+      mode: "act",
+      task,
+      planPath: opts.planPath || null,
+      startedAt: runStartedAt,
+      endedAt: (/* @__PURE__ */ new Date()).toISOString(),
+      outcome,
+      summary: summary || "",
+      steps: trail.filter((t2) => t2.step > 0),
+      approvals: runApprovals,
+      filesChanged: runFilesChanged,
+      checkpoint: runCkptPath || null,
+      skipped: runSkipped
+    });
     sendBtn.textContent = "Send";
     sendBtn.onclick = oldSend;
     agentRunning = false;
@@ -44883,7 +45193,11 @@
         deletions,
         checkpoints,
         todos,
-        task
+        task,
+        runId,
+        runCkptPath: runCkptPath || "",
+        runOriginals,
+        runSkipped
       });
     } else if (outcome === "done") {
       agentActiveClear();
@@ -44912,6 +45226,12 @@
     agentPillShow("\u{1F4DD} Planning: " + task.slice(0, 50));
     const trail = [];
     const planT0 = Date.now();
+    const planRunId = makeAgentRunId(
+      /* @__PURE__ */ new Date(),
+      Math.random().toString(36).slice(2, 6)
+    );
+    const planStartedAt = (/* @__PURE__ */ new Date()).toISOString();
+    let planPath = "";
     let todos = [];
     addMsg("YOU", "\u{1F4DD} Plan: " + task);
     const sendBtn = $("chatSend");
@@ -45076,25 +45396,56 @@
     agentRunning = false;
     if (outcome === "done") {
       try {
+        planPath = planFilePath(/* @__PURE__ */ new Date());
+        const pd = await postJson(
+          "/api/file",
+          {
+            path: planPath,
+            content: buildPlanFile(
+              task,
+              planText,
+              todos,
+              /* @__PURE__ */ new Date()
+            )
+          }
+        );
+        if (pd.error) planPath = "";
+      } catch (e) {
+        planPath = "";
+      }
+      try {
         localStorage.setItem(
           "ghostide-agent2-plan",
           JSON.stringify({
             task,
             plan: planText,
             todos,
+            planPath,
             ts: Date.now()
           })
         );
       } catch (e) {
       }
-      const body = addMsg("GHOST", "\u{1F4DD} Plan ready: " + (summary || task) + "\n\n" + planText + "\n\nSteps:\n" + (todos.length ? todos.map((t2, i2) => i2 + 1 + ". " + t2.text).join("\n") : "(no steps recorded)"));
+      const body = addMsg("GHOST", "\u{1F4DD} Plan ready: " + (summary || task) + "\n\n" + planText + "\n\nSteps:\n" + (todos.length ? todos.map((t2, i2) => i2 + 1 + ". " + t2.text).join("\n") : "(no steps recorded)") + (planPath ? "\n\nSaved as " + planPath + " - you can open and edit that file; acting on the plan uses the file's current text." : ""));
       const row = document.createElement("div");
       row.className = "optRow";
       const actBtn = document.createElement("button");
       actBtn.textContent = "\u{1F916} Act on this plan";
-      actBtn.onclick = () => {
+      actBtn.onclick = async () => {
         row.remove();
-        runAgent(task, { plan: planText, todos });
+        let effective = planText;
+        if (planPath) {
+          try {
+            const r = await fetch("/api/file?path=" + encodeURIComponent(planPath));
+            const d = await r.json();
+            if (!d.error && d.content) {
+              const bodyText = planBodyFromFile(d.content);
+              if (bodyText) effective = bodyText;
+            }
+          } catch (e) {
+          }
+        }
+        runAgent(task, { plan: effective, todos, planPath });
       };
       const disBtn = document.createElement("button");
       disBtn.textContent = "Discard plan";
@@ -45108,6 +45459,21 @@
     } else if (outcome === "stopped") {
       addMsg("SYSTEM", "Planning stopped. Nothing was changed.");
     }
+    postRunRecord({
+      id: planRunId,
+      mode: "plan",
+      task,
+      planPath: planPath || null,
+      startedAt: planStartedAt,
+      endedAt: (/* @__PURE__ */ new Date()).toISOString(),
+      outcome,
+      summary: summary || "",
+      steps: trail.filter((t2) => t2.step > 0),
+      approvals: [],
+      filesChanged: [],
+      checkpoint: null,
+      skipped: []
+    });
     agentPillHide();
     notifyDone(
       "Plan finished",
@@ -45163,33 +45529,55 @@
           return null;
         }
       }
-      for (const p of approved) originals[p] = await originalOf(p);
+      const runOriginals = review.runOriginals || {};
+      for (const p of approved)
+        originals[p] = p in runOriginals ? runOriginals[p] : await originalOf(p);
       for (const p of approvedDel)
-        deletedOriginals[p] = await originalOf(p);
+        deletedOriginals[p] = p in runOriginals ? runOriginals[p] : await originalOf(p);
       let ckptPath = "";
       if (approved.size || approvedDel.size) {
-        ckptPath = checkpointFileName(/* @__PURE__ */ new Date());
         const payload = buildDiskCheckpoint(
           review.task || "",
           originals,
           deletedOriginals
         );
+        if (review.runCkptPath) {
+          ckptPath = review.runCkptPath;
+          for (const [p, c] of Object.entries(runOriginals)) {
+            if ((review.deletions || /* @__PURE__ */ new Set()).has(p)) {
+              if (!(p in payload.deleted))
+                payload.deleted[p] = c;
+            } else if (!(p in payload.files)) {
+              payload.files[p] = c;
+            }
+          }
+          payload.runId = review.runId || null;
+          payload.run = true;
+          payload.skipped = (review.runSkipped || []).slice();
+        } else {
+          ckptPath = checkpointFileName(/* @__PURE__ */ new Date());
+        }
         const cd = await postJson(
           "/api/file",
           { path: ckptPath, content: JSON.stringify(payload) }
         );
         if (!cd.error) {
           const idx = ckptIndexLoad();
-          idx.unshift({
+          const entry = {
             path: ckptPath,
             created: payload.created,
             task: payload.task,
-            files: Object.keys(originals).concat(Object.keys(deletedOriginals))
-          });
+            files: Object.keys(payload.files).concat(Object.keys(payload.deleted)),
+            run: !!payload.run
+          };
+          const at = idx.findIndex((x) => x.path === ckptPath);
+          if (at >= 0) idx[at] = entry;
+          else idx.unshift(entry);
           ckptIndexSave(idx);
         } else ckptPath = "";
       }
       let n = 0;
+      const appliedChanges = [];
       for (const [p, c] of staged) {
         if (!approved.has(p)) continue;
         const d = await postJson(
@@ -45198,6 +45586,10 @@
         );
         if (!d.error) {
           n++;
+          appliedChanges.push({
+            path: p,
+            kind: originals[p] == null ? "created" : "modified"
+          });
           if (p === currentFile) await reloadCurrentFromDisk();
           else if (tabStates.has(p)) tabStates.delete(p);
         }
@@ -45205,7 +45597,10 @@
       let nd = 0;
       for (const p of approvedDel) {
         const d = await postJson("/api/file/delete", { path: p });
-        if (d && !d.error) nd++;
+        if (d && !d.error) {
+          nd++;
+          appliedChanges.push({ path: p, kind: "deleted" });
+        }
       }
       loadFiles();
       addMsg("SYSTEM", "Agent changes applied: " + n + " file(s) saved" + (nd ? ", " + nd + " deleted" : "") + (ckptPath ? ". Undo point saved: " + ckptPath + " (Chat options: Checkpoints)." : "."));
@@ -45222,6 +45617,14 @@
         }
       } catch (e) {
       }
+      if (ckptPath && appliedChanges.length)
+        openRunReview({
+          task: review.task || "",
+          runId: review.runId || null,
+          ckptPath,
+          changes: appliedChanges,
+          skipped: (review.runSkipped || []).slice()
+        });
     };
     refreshApply();
     box.appendChild(applyRow);
@@ -45339,6 +45742,240 @@
     if (currentFile) await reloadCurrentFromDisk();
     addMsg("SYSTEM", "Checkpoint restored: " + n + " file(s) returned to their pre-apply state (" + (payload.task || "agent task") + ").");
   }
+  async function openRunReview(ctx) {
+    const box = $("todoResults");
+    $("todoTitle").textContent = "\u{1F9FE} Run review - keep or undo per file";
+    box.textContent = "";
+    const loadEl = document.createElement("div");
+    loadEl.className = "dim";
+    loadEl.textContent = "Loading the run checkpoint\u2026";
+    box.appendChild(loadEl);
+    $("todoPanel").classList.remove("hidden");
+    let payload = null;
+    try {
+      const r = await fetch("/api/file?path=" + encodeURIComponent(ctx.ckptPath));
+      const d = await r.json();
+      if (!d.error && d.content)
+        payload = JSON.parse(d.content);
+    } catch (e) {
+    }
+    if (!payload || payload.kind !== "ghostide-checkpoint") {
+      box.textContent = "";
+      const el = document.createElement("div");
+      el.className = "dim";
+      el.textContent = "The run checkpoint is missing (" + ctx.ckptPath + "), so per-file undo is not available for this run.";
+      box.appendChild(el);
+      return;
+    }
+    payload.files = payload.files || {};
+    payload.deleted = payload.deleted || {};
+    const state = /* @__PURE__ */ new Map();
+    for (const c of ctx.changes || []) {
+      let original;
+      if (c.path in payload.deleted)
+        original = payload.deleted[c.path];
+      else if (c.path in payload.files)
+        original = payload.files[c.path];
+      else continue;
+      state.set(c.path, { kind: c.kind, original, done: "" });
+    }
+    const skipped = ctx.skipped && ctx.skipped.length ? ctx.skipped : payload.skipped || [];
+    async function savePayload() {
+      const left = Object.keys(payload.files).length + Object.keys(payload.deleted).length;
+      if (!left) {
+        await postJson(
+          "/api/file/delete",
+          { path: ctx.ckptPath }
+        );
+        ckptIndexSave(ckptIndexLoad().filter((x) => x.path !== ctx.ckptPath));
+        return;
+      }
+      await postJson(
+        "/api/file",
+        {
+          path: ctx.ckptPath,
+          content: JSON.stringify(payload)
+        }
+      );
+    }
+    function dropEntry(p) {
+      delete payload.files[p];
+      delete payload.deleted[p];
+    }
+    async function refreshEditor(p) {
+      if (p === currentFile) await reloadCurrentFromDisk();
+      else if (tabStates.has(p)) tabStates.delete(p);
+      loadFiles();
+    }
+    async function currentOf(p) {
+      try {
+        const r = await fetch("/api/file?path=" + encodeURIComponent(p));
+        const d = await r.json();
+        return d.error ? "" : d.content || "";
+      } catch (e) {
+        return "";
+      }
+    }
+    async function keepFile(p) {
+      const e = state.get(p);
+      if (!e || e.done) return;
+      dropEntry(p);
+      await savePayload();
+      e.done = "kept";
+      addMsg("SYSTEM", "Kept " + p + " - its undo point is dropped.");
+      render();
+    }
+    async function undoFile(p) {
+      const e = state.get(p);
+      if (!e || e.done) return;
+      let ok = false;
+      if (e.kind === "created") {
+        const d = await postJson(
+          "/api/file/delete",
+          { path: p }
+        );
+        ok = !!(d && !d.error);
+      } else {
+        const d = await postJson(
+          "/api/file",
+          { path: p, content: e.original }
+        );
+        ok = !!(d && !d.error);
+      }
+      if (!ok) {
+        addMsg("SYSTEM", "Undo failed for " + p + ".");
+        return;
+      }
+      dropEntry(p);
+      await savePayload();
+      e.done = "undone";
+      await refreshEditor(p);
+      addMsg("SYSTEM", "Undid " + p + " - restored from the run checkpoint.");
+      render();
+    }
+    async function undoHunk(p, hunk, host) {
+      const e = state.get(p);
+      if (!e || e.done) return;
+      const current = await currentOf(p);
+      const r = reverseUnifiedHunk(current, hunk);
+      if (!r.ok) {
+        addMsg("SYSTEM", "Hunk undo refused for " + p + ": " + r.error);
+        return;
+      }
+      const d = await postJson(
+        "/api/file",
+        { path: p, content: r.content }
+      );
+      if (d.error) {
+        addMsg("SYSTEM", "Hunk undo failed for " + p + ".");
+        return;
+      }
+      await refreshEditor(p);
+      if (r.content === e.original) {
+        dropEntry(p);
+        await savePayload();
+        e.done = "undone";
+        addMsg("SYSTEM", "Undid " + p + " - every hunk reversed, file is back to its pre-run content.");
+        render();
+      } else {
+        addMsg("SYSTEM", "One hunk of " + p + " undone.");
+        await showHunks(p, host);
+      }
+    }
+    async function showHunks(p, host) {
+      const e = state.get(p);
+      host.textContent = "";
+      const wait = document.createElement("div");
+      wait.className = "dim";
+      wait.textContent = "Computing diff\u2026";
+      host.appendChild(wait);
+      const current = await currentOf(p);
+      const d = await postJson(
+        "/api/diff-text",
+        {
+          path: p,
+          base: e.original == null ? "" : e.original,
+          content: current
+        }
+      );
+      pendingRefactor = null;
+      $("diffApply").classList.add("hidden");
+      $("diffDiscard").classList.add("hidden");
+      $("diffTitle").textContent = "Run diff: " + p + " (checkpoint -> now)";
+      $("diffOut").textContent = d.diff || "(no differences)";
+      $("diffPanel").classList.remove("hidden");
+      host.textContent = "";
+      const hunks = parseUnifiedDiff(d.diff || "");
+      if (!hunks.length) {
+        const el = document.createElement("div");
+        el.className = "dim";
+        el.textContent = "   (no hunks - the file matches its checkpoint)";
+        host.appendChild(el);
+        return;
+      }
+      for (const h of hunks) {
+        const row = document.createElement("div");
+        row.className = "findRow";
+        row.textContent = "   \u21A9 undo hunk @@ -" + h.oldStart + "," + h.oldCount + " +" + h.newStart + "," + h.newCount + " @@";
+        row.onclick = () => undoHunk(p, h, host);
+        host.appendChild(row);
+      }
+    }
+    function render() {
+      box.textContent = "";
+      const head = document.createElement("div");
+      head.className = "dim";
+      head.textContent = "Run: " + (ctx.task || "agent task") + ". Keep drops a file's undo point; Undo restores the pre-run content from " + ctx.ckptPath + ".";
+      box.appendChild(head);
+      const pending = [...state.entries()].filter(([, e]) => !e.done);
+      if (pending.length > 1) {
+        const all = document.createElement("div");
+        all.className = "findRow";
+        all.textContent = "\u21A9 UNDO ALL (" + pending.length + " file(s) still pending)";
+        all.onclick = async () => {
+          for (const [p] of pending) await undoFile(p);
+        };
+        box.appendChild(all);
+      }
+      if (skipped.length) {
+        const sk = document.createElement("div");
+        sk.className = "dim";
+        sk.textContent = "Not covered by undo (too large or binary when the run touched them): " + skipped.join(", ");
+        box.appendChild(sk);
+      }
+      if (!state.size) {
+        const el = document.createElement("div");
+        el.className = "dim";
+        el.textContent = "Nothing left to review - every change was kept or undone.";
+        box.appendChild(el);
+      }
+      for (const [p, e] of state) {
+        const row = document.createElement("div");
+        row.className = "findRow";
+        row.textContent = (e.done === "kept" ? "\u2713 kept: " : e.done === "undone" ? "\u21A9 undone: " : e.kind === "created" ? "\uFF0B created: " : e.kind === "deleted" ? "\u{1F5D1} deleted: " : "\u270F\uFE0F modified: ") + p;
+        box.appendChild(row);
+        if (e.done) continue;
+        const diffRow = document.createElement("div");
+        diffRow.className = "findRow";
+        diffRow.textContent = "   \u{1F441} diff + hunks for " + p;
+        const host = document.createElement("div");
+        diffRow.onclick = () => showHunks(p, host);
+        box.appendChild(diffRow);
+        box.appendChild(host);
+        const keepRow = document.createElement("div");
+        keepRow.className = "findRow";
+        keepRow.textContent = "   \u2713 KEEP " + p;
+        keepRow.onclick = () => keepFile(p);
+        box.appendChild(keepRow);
+        const undoRow = document.createElement("div");
+        undoRow.className = "findRow";
+        undoRow.textContent = "   \u21A9 UNDO " + p;
+        undoRow.onclick = () => undoFile(p);
+        box.appendChild(undoRow);
+      }
+    }
+    render();
+  }
   function openCheckpointsPanel() {
     $("todoTitle").textContent = "\u{1F5C2} Agent checkpoints";
     const box = $("todoResults");
@@ -45371,7 +46008,72 @@
         openCheckpointsPanel();
       };
       box.appendChild(drow);
+      if (entry.path.includes("ckpt-run-")) {
+        const vrow = document.createElement("div");
+        vrow.className = "findRow";
+        vrow.textContent = "   \u{1F9FE} Review run changes (keep / undo per file)";
+        vrow.onclick = async () => {
+          let payload = null;
+          try {
+            const r = await fetch("/api/file?path=" + encodeURIComponent(entry.path));
+            const d = await r.json();
+            if (!d.error && d.content)
+              payload = JSON.parse(d.content);
+          } catch (e) {
+          }
+          const changes = [];
+          if (payload) {
+            for (const [p, c] of Object.entries(payload.files || {}))
+              changes.push({
+                path: p,
+                kind: c == null ? "created" : "modified"
+              });
+            for (const p of Object.keys(payload.deleted || {}))
+              changes.push({ path: p, kind: "deleted" });
+          }
+          openRunReview({
+            task: entry.task || "",
+            ckptPath: entry.path,
+            changes,
+            skipped: payload && payload.skipped || []
+          });
+        };
+        box.appendChild(vrow);
+      }
     }
+    const runsHead = document.createElement("div");
+    runsHead.className = "dim";
+    runsHead.textContent = "\u{1F916} Recent agent runs";
+    box.appendChild(runsHead);
+    const runsBox = document.createElement("div");
+    const runsWait = document.createElement("div");
+    runsWait.className = "dim";
+    runsWait.textContent = "Loading run records\u2026";
+    runsBox.appendChild(runsWait);
+    box.appendChild(runsBox);
+    fetch("/api/agent-runs").then((r) => r.json()).then((d) => {
+      runsBox.textContent = "";
+      const runs = d && d.runs || [];
+      if (!runs.length) {
+        const el = document.createElement("div");
+        el.className = "dim";
+        el.textContent = "No run records yet. One is saved each time an agent or plan run ends.";
+        runsBox.appendChild(el);
+        return;
+      }
+      for (const run of runs.slice(0, 10)) {
+        const row = document.createElement("div");
+        row.className = "findRow";
+        row.textContent = (run.mode === "plan" ? "\u{1F4DD} " : "\u{1F916} ") + (run.endedAt || run.startedAt || "") + " - " + (run.task || "agent task") + " (" + (run.outcome || "?") + ", " + run.files + " file(s))";
+        runsBox.appendChild(row);
+      }
+    }).catch(() => {
+      runsBox.textContent = "";
+      const el = document.createElement("div");
+      el.className = "dim";
+      el.textContent = "Run records unavailable.";
+      runsBox.appendChild(el);
+    });
     $("todoPanel").classList.remove("hidden");
   }
   var testDefLines = {};

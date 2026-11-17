@@ -11578,6 +11578,221 @@ function checkpointFileName(date) {
 window.__ghostParseAgent2 = parseAgent2Action;
 window.__ghostApplyEdit = applyEditPatch;
 
+/* ---------------- Agent trust layer (Desktop Cycle 2, D2):
+   plan files, run-scoped checkpoints, run records, and
+   the data behind the post-run review ----------------
+/*@@RUNREVIEW@@*/
+/* Pure helpers for the trust layer, kept free of DOM and
+   fetch so the harness can extract and test them. The
+   wiring (runAgent, runPlan, the review panels) lives
+   further down.
+   - A finished Plan-mode run also writes its plan to a
+     Markdown file in the workspace; acting on the plan
+     re-reads that file, so edits to it change what runs.
+   - Each Act run owns ONE checkpoint: the pre-run
+     content of every file the run touches, captured
+     lazily on first touch and written through to
+     .ghostide/checkpoints/. Files over the cap or
+     binary are skipped and recorded, never silently.
+   - At run end the client posts a run record to
+     /api/agent-runs; the server stores it as data. */
+const RUN_CKPT_MAX_CHARS = 512000;
+const RUN_RECORD_MAX_STEPS = 400;
+function agentRunStamp(date) {
+  const d = date || new Date();
+  const p = (x) => String(x).padStart(2, "0");
+  return d.getFullYear() + p(d.getMonth() + 1) +
+    p(d.getDate()) + "-" + p(d.getHours()) +
+    p(d.getMinutes()) + p(d.getSeconds());
+}
+function makeAgentRunId(date, rand) {
+  return "run-" + agentRunStamp(date) + "-" +
+    String(rand || "0000").replace(/[^a-z0-9]/gi, "")
+      .slice(0, 6);
+}
+function runCheckpointPath(runId) {
+  return ".ghostide/checkpoints/ckpt-" + runId + ".json";
+}
+function planFilePath(date) {
+  return ".ghostide/plans/plan-" + agentRunStamp(date) +
+    ".md";
+}
+function buildPlanFile(task, planText, todos, date) {
+  const steps = normalizeAgentTodos(todos);
+  const lines = [
+    "# GhostIDE plan",
+    "",
+    "Task: " + String(task || "").slice(0, 300),
+    "Created: " + (date || new Date()).toISOString(),
+    "",
+    "Steps:",
+  ];
+  if (steps.length)
+    steps.forEach((t, i) =>
+      lines.push((i + 1) + ". " + t.text));
+  else lines.push("(no steps recorded)");
+  lines.push("", "---", "",
+    String(planText || "").trim(), "");
+  return lines.join("\n");
+}
+function planBodyFromFile(content) {
+  /* The plan body is everything after the generated
+     header's --- separator. A file without one (the
+     user replaced it wholesale) is used as-is. */
+  const text = String(content || "");
+  const lines = text.split("\n");
+  for (let i = 0; i < lines.length; i++)
+    if (lines[i].trim() === "---")
+      return lines.slice(i + 1).join("\n").trim();
+  return text.trim();
+}
+function splitRunOriginals(originals, deletedPaths) {
+  const del = new Set(deletedPaths || []);
+  const files = {}, deleted = {};
+  for (const [p, c] of Object.entries(originals || {})) {
+    if (del.has(p)) deleted[p] = c;
+    else files[p] = c;
+  }
+  return { files, deleted };
+}
+function runChangeKind(path, originals, deletedPaths) {
+  if ((deletedPaths || []).includes(path)) return "deleted";
+  if (originals && path in originals &&
+      originals[path] == null) return "created";
+  return "modified";
+}
+function parseUnifiedDiff(text) {
+  /* Unified diff text -> hunks with typed lines. Header
+     lines (---, +++, diff, index) are skipped; a hunk
+     ends where its declared line counts are met, so a
+     stray trailing line can never join the last hunk. */
+  const hunks = [];
+  let cur = null, gotOld = 0, gotNew = 0;
+  for (const line of String(text || "").split("\n")) {
+    const m = line.match(
+      /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
+    if (m) {
+      cur = { oldStart: +m[1],
+        oldCount: m[2] === undefined ? 1 : +m[2],
+        newStart: +m[3],
+        newCount: m[4] === undefined ? 1 : +m[4],
+        lines: [] };
+      hunks.push(cur);
+      gotOld = 0; gotNew = 0;
+      continue;
+    }
+    if (!cur) continue;
+    if (gotOld >= cur.oldCount && gotNew >= cur.newCount) {
+      cur = null;
+      continue;
+    }
+    if (line.startsWith("\\")) continue;
+    const t = line.charAt(0);
+    if (t === " " || t === "+" || t === "-") {
+      cur.lines.push({ t, text: line.slice(1) });
+      if (t !== "+") gotOld++;
+      if (t !== "-") gotNew++;
+    } else if (line === "") {
+      cur.lines.push({ t: " ", text: "" });
+      gotOld++; gotNew++;
+    }
+  }
+  return hunks;
+}
+function reverseUnifiedHunk(content, hunk) {
+  /* Undo exactly one hunk: find the hunk's new side
+     (context + added lines) in the current content -
+     at the recorded position first, then within a
+     small window - and swap in the old side. If the
+     new side is not found verbatim, refuse: the file
+     changed under the review, and guessing would
+     corrupt it. */
+  const lines = String(content == null ? "" : content)
+    .split("\n");
+  const newSide = [], oldSide = [];
+  for (const l of hunk.lines) {
+    if (l.t === " " || l.t === "+") newSide.push(l.text);
+    if (l.t === " " || l.t === "-") oldSide.push(l.text);
+  }
+  if (!newSide.length && !oldSide.length)
+    return { ok: false, error: "empty hunk" };
+  const start0 = Math.max(0, (hunk.newStart || 1) - 1);
+  const matches = (at) => {
+    if (at < 0 || at + newSide.length > lines.length)
+      return false;
+    for (let i = 0; i < newSide.length; i++)
+      if (lines[at + i] !== newSide[i]) return false;
+    return true;
+  };
+  let at = -1;
+  if (matches(start0)) at = start0;
+  else {
+    for (let d = 1; d <= 80 && at < 0; d++) {
+      if (matches(start0 - d)) at = start0 - d;
+      else if (matches(start0 + d)) at = start0 + d;
+    }
+  }
+  if (at < 0)
+    return { ok: false,
+      error: "this hunk no longer matches the file " +
+        "(it changed since the run) - undo the whole " +
+        "file instead" };
+  const out = lines.slice(0, at).concat(oldSide,
+    lines.slice(at + newSide.length));
+  return { ok: true, content: out.join("\n") };
+}
+function buildRunRecord(f) {
+  /* Sanitize a run record before it is posted: capped
+     strings, capped lists, fixed shape. The server
+     validates again on its side. */
+  f = f || {};
+  const cap = (s, n) => String(s == null ? "" : s)
+    .slice(0, n);
+  const steps = (Array.isArray(f.steps) ? f.steps : [])
+    .slice(0, RUN_RECORD_MAX_STEPS)
+    .map((s) => ({ step: (s && s.step) | 0,
+      type: cap(s && s.type, 40),
+      target: cap(s && s.target, 200) }));
+  const approvals = (Array.isArray(f.approvals)
+      ? f.approvals : []).slice(0, 100)
+    .map((a) => ({ kind: cap(a && a.kind, 20),
+      target: cap(a && a.target, 200),
+      verdict: cap(a && a.verdict, 20) }));
+  const filesChanged = (Array.isArray(f.filesChanged)
+      ? f.filesChanged : []).slice(0, 200)
+    .map((c) => ({ path: cap(c && c.path, 300),
+      kind: cap(c && c.kind, 20) }));
+  return {
+    kind: "ghostide-agent-run", version: 1,
+    id: cap(f.id, 80),
+    mode: f.mode === "plan" ? "plan" : "act",
+    task: cap(f.task, 500),
+    planPath: f.planPath || null,
+    startedAt: f.startedAt || "",
+    endedAt: f.endedAt || "",
+    outcome: cap(f.outcome, 40),
+    summary: cap(f.summary, 500),
+    steps, approvals, filesChanged,
+    checkpoint: f.checkpoint || null,
+    skipped: (Array.isArray(f.skipped) ? f.skipped : [])
+      .slice(0, 100).map((p) => cap(p, 300)),
+  };
+}
+/*@@RUNREVIEW-END@@*/
+window.__ghostRunReview = { agentRunStamp, makeAgentRunId,
+  runCheckpointPath, planFilePath, buildPlanFile,
+  planBodyFromFile, splitRunOriginals, runChangeKind,
+  parseUnifiedDiff, reverseUnifiedHunk, buildRunRecord,
+  RUN_CKPT_MAX_CHARS };
+function postRunRecord(fields) {
+  /* Fire and forget: a record is an aid (and the
+     substrate for later supervision), never a blocker. */
+  try {
+    postJson("/api/agent-runs", buildRunRecord(fields))
+      .catch(() => {});
+  } catch (e) { /* as above */ }
+}
+
 /* ---------------- Agent v3: toolbelt, batching, memory,
    policy packs (v2.43, Track A) ----------------
 /*@@AGENT3@@*/
@@ -11995,6 +12210,64 @@ async function runAgent(task, opts) {
   const deletions = new Set(opts.deletions || []);
   let todos = normalizeAgentTodos(opts.todos || []);
   let checkpoints = [];
+  /* D2: one checkpoint per run. The pre-run content of
+     every file this run touches is captured lazily, on
+     first touch, from DISK (staged content never leaks
+     into it), and written through to
+     .ghostide/checkpoints/ as it is captured, so the
+     post-run review can undo per file or per hunk.
+     Files over the cap or binary are skipped and
+     recorded in runSkipped - named in the review,
+     never silently dropped. */
+  const runId = makeAgentRunId(new Date(),
+    Math.random().toString(36).slice(2, 6));
+  const runStartedAt = new Date().toISOString();
+  const runOriginals = {};
+  const runSkipped = [];
+  const runApprovals = [];
+  let runCkptPath = "";
+  async function persistRunCheckpoint() {
+    if (!Object.keys(runOriginals).length &&
+        !runSkipped.length) return;
+    const split = splitRunOriginals(runOriginals,
+      [...deletions]);
+    const payload = buildDiskCheckpoint(task, split.files,
+      split.deleted);
+    payload.runId = runId;
+    payload.run = true;
+    payload.skipped = runSkipped.slice();
+    if (!runCkptPath) runCkptPath = runCheckpointPath(runId);
+    const cd = await postJson("/api/file",
+      { path: runCkptPath,
+        content: JSON.stringify(payload) });
+    if (cd.error) return;
+    const idx = ckptIndexLoad();
+    const entry = { path: runCkptPath,
+      created: payload.created, task: payload.task,
+      files: Object.keys(runOriginals), run: true };
+    const at = idx.findIndex((x) => x.path === runCkptPath);
+    if (at >= 0) idx[at] = entry; else idx.unshift(entry);
+    ckptIndexSave(idx);
+  }
+  async function captureRunOriginal(path) {
+    if (path in runOriginals ||
+        runSkipped.includes(path)) return;
+    let content = null;
+    try {
+      const r = await fetch("/api/file?path=" +
+        encodeURIComponent(path));
+      const d = await r.json();
+      if (!d.error) content = d.content;
+    } catch (e) { /* treated as not existing */ }
+    if (content != null &&
+        (content.length > RUN_CKPT_MAX_CHARS ||
+         content.includes("\0"))) {
+      runSkipped.push(path);
+    } else {
+      runOriginals[path] = content;
+    }
+    await persistRunCheckpoint();
+  }
   /* Seatbelt-style RUN policy pack (v2.43): "each" prompts
      per command (the v2 behavior), "plan" auto-approves when
      this run follows a user-approved plan, "all" auto-approves
@@ -12528,6 +12801,7 @@ async function runAgent(task, opts) {
         (act.path ? " under " + act.path : "") + ":\n" +
         names.slice(0, 120).join("\n") });
     } else if (act.type === "write") {
+      await captureRunOriginal(act.path);
       staged.set(act.path, act.content);
       deletions.delete(act.path);
       const note = await agentCheckOne(act.path, act.content);
@@ -12538,6 +12812,7 @@ async function runAgent(task, opts) {
         act.path + ". " + staged.size + " file(s) staged. " +
         "Automatic check: " + note + " Continue." });
     } else if (act.type === "edit") {
+      await captureRunOriginal(act.path);
       const base = await readForAgent(act.path);
       const r = applyEditPatch(base, act.oldText, act.newText);
       if (!r.ok) {
@@ -12572,6 +12847,8 @@ async function runAgent(task, opts) {
             "that command failed: " + q.error +
             " Continue without it." });
         } else {
+          runApprovals.push({ kind: "run",
+            target: act.command, verdict: "queued" });
           addMsg("SYSTEM", "📥 RUN queued for approval (" +
             q.id + "): " + act.command);
           messages.push({ role: "user", content: "That " +
@@ -12582,10 +12859,15 @@ async function runAgent(task, opts) {
         }
         continue;
       }
+      const wasAuto = runAllowAll;
       let verdict = runAllowAll ? "all"
         : await agentApproveRunUi(act.command);
       if (verdict === "all") runAllowAll = true;
       if (agentStop) { outcome = "stopped"; break; }
+      runApprovals.push({ kind: "run", target: act.command,
+        verdict: verdict === "deny" ? "denied"
+          : wasAuto ? "auto"
+          : verdict === "all" ? "granted-all" : "granted" });
       if (verdict === "deny") {
         addMsg("SYSTEM", "⛔ RUN denied by you: " + act.command);
         messages.push({ role: "user", content: "The user " +
@@ -12613,6 +12895,8 @@ async function runAgent(task, opts) {
             "that deletion failed: " + q.error +
             " Continue without it." });
         } else {
+          runApprovals.push({ kind: "delete",
+            target: act.path, verdict: "queued" });
           addMsg("SYSTEM", "📥 DELETE queued for approval (" +
             q.id + "): " + act.path);
           messages.push({ role: "user", content: "Deletion " +
@@ -12622,6 +12906,7 @@ async function runAgent(task, opts) {
         }
         continue;
       }
+      await captureRunOriginal(act.path);
       staged.delete(act.path);
       deletions.add(act.path);
       snapshot("DELETE " + act.path, step);
@@ -12674,6 +12959,9 @@ async function runAgent(task, opts) {
             "that MCP call failed: " + q.error +
             " Continue without it." });
         } else {
+          runApprovals.push({ kind: "mcp",
+            target: act.server + "." + act.tool,
+            verdict: "queued" });
           addMsg("SYSTEM", "📥 MCP call queued for approval (" +
             q.id + "): " + act.server + "." + act.tool);
           messages.push({ role: "user", content: "That MCP " +
@@ -12688,6 +12976,10 @@ async function runAgent(task, opts) {
           JSON.stringify(act.args || {}).slice(0, 300));
         if (verdict === "all") runAllowAll = true;
         if (agentStop) { outcome = "stopped"; break; }
+        runApprovals.push({ kind: "mcp",
+          target: act.server + "." + act.tool,
+          verdict: verdict === "deny" ? "denied"
+            : verdict === "all" ? "granted-all" : "granted" });
         if (verdict === "deny") {
           addMsg("SYSTEM", "⛔ MCP call denied by you: " +
             act.server + "." + act.tool);
@@ -12700,6 +12992,9 @@ async function runAgent(task, opts) {
             content: t + "\nContinue." });
         }
       } else {
+        runApprovals.push({ kind: "mcp",
+          target: act.server + "." + act.tool,
+          verdict: "auto" });
         const t = await agentToolText(act);
         messages.push({ role: "user",
           content: t + "\nContinue." });
@@ -12773,6 +13068,27 @@ async function runAgent(task, opts) {
     trail.push({ step: 0, type: "repairs",
       target: repairs + " repair round(s)" });
   saveTrail(task, trail, (Date.now() - agentT0) / 1000);
+  /* D2: the run record - one JSON per run, stored by
+     the server under .ghostide/agent-runs/. It describes
+     the run as staged; what the user then kept or undid
+     lives in the run checkpoint and the review. */
+  const runFilesChanged = [];
+  for (const p of staged.keys())
+    runFilesChanged.push({ path: p,
+      kind: runChangeKind(p, runOriginals, [...deletions]) });
+  for (const p of deletions)
+    if (!staged.has(p))
+      runFilesChanged.push({ path: p, kind: "deleted" });
+  postRunRecord({ id: runId, mode: "act", task,
+    planPath: opts.planPath || null,
+    startedAt: runStartedAt,
+    endedAt: new Date().toISOString(),
+    outcome, summary: summary || "",
+    steps: trail.filter((t) => t.step > 0),
+    approvals: runApprovals,
+    filesChanged: runFilesChanged,
+    checkpoint: runCkptPath || null,
+    skipped: runSkipped });
   sendBtn.textContent = "Send";
   sendBtn.onclick = oldSend;
   agentRunning = false;
@@ -12809,7 +13125,8 @@ async function runAgent(task, opts) {
       " step(s), " + repairs + " repair round(s), " +
       Math.round((Date.now() - agentT0) / 1000) + "s.)");
     openAgentReview({ staged, deletions, checkpoints, todos,
-      task });
+      task, runId, runCkptPath: runCkptPath || "",
+      runOriginals, runSkipped });
   } else if (outcome === "done") {
     agentActiveClear();
     /* Cycle 6 I20: the accounting shows on every
@@ -12844,6 +13161,13 @@ async function runPlan(task) {
   agentPillShow("📝 Planning: " + task.slice(0, 50));
   const trail = [];
   const planT0 = Date.now();
+  /* D2: a finished plan also lands in a workspace file
+     (see the end of this function); the run record for
+     a plan run carries its path. */
+  const planRunId = makeAgentRunId(new Date(),
+    Math.random().toString(36).slice(2, 6));
+  const planStartedAt = new Date().toISOString();
+  let planPath = "";
   let todos = [];
   addMsg("YOU", "📝 Plan: " + task);
   const sendBtn = $("chatSend");
@@ -13008,22 +13332,52 @@ async function runPlan(task) {
   sendBtn.onclick = oldSend;
   agentRunning = false;
   if (outcome === "done") {
+    /* D2: the plan is also a file in the workspace, so
+       it can be opened and edited like any other file.
+       Acting re-reads the file (below): the file is the
+       source of truth when it exists. */
+    try {
+      planPath = planFilePath(new Date());
+      const pd = await postJson("/api/file",
+        { path: planPath,
+          content: buildPlanFile(task, planText, todos,
+            new Date()) });
+      if (pd.error) planPath = "";
+    } catch (e) { planPath = ""; }
     try {
       localStorage.setItem("ghostide-agent2-plan",
         JSON.stringify({ task, plan: planText, todos,
-          ts: Date.now() }));
+          planPath, ts: Date.now() }));
     } catch (e) {}
     const body = addMsg("GHOST", "📝 Plan ready: " +
       (summary || task) + "\n\n" + planText + "\n\nSteps:\n" +
       (todos.length ? todos.map((t, i) => (i + 1) + ". " + t.text)
-        .join("\n") : "(no steps recorded)"));
+        .join("\n") : "(no steps recorded)") +
+      (planPath ? "\n\nSaved as " + planPath +
+        " - you can open and edit that file; acting on " +
+        "the plan uses the file's current text." : ""));
     const row = document.createElement("div");
     row.className = "optRow";
     const actBtn = document.createElement("button");
     actBtn.textContent = "🤖 Act on this plan";
-    actBtn.onclick = () => {
+    actBtn.onclick = async () => {
       row.remove();
-      runAgent(task, { plan: planText, todos });
+      /* D2: re-read the plan file so user edits to it
+         change what gets executed. Fall back to the
+         in-memory plan when the file is gone. */
+      let effective = planText;
+      if (planPath) {
+        try {
+          const r = await fetch("/api/file?path=" +
+            encodeURIComponent(planPath));
+          const d = await r.json();
+          if (!d.error && d.content) {
+            const bodyText = planBodyFromFile(d.content);
+            if (bodyText) effective = bodyText;
+          }
+        } catch (e) { /* keep the in-memory plan */ }
+      }
+      runAgent(task, { plan: effective, todos, planPath });
     };
     const disBtn = document.createElement("button");
     disBtn.textContent = "Discard plan";
@@ -13037,6 +13391,16 @@ async function runPlan(task) {
   } else if (outcome === "stopped") {
     addMsg("SYSTEM", "Planning stopped. Nothing was changed.");
   }
+  /* D2: plan runs leave a run record too, pointing at
+     the plan file when one was written. */
+  postRunRecord({ id: planRunId, mode: "plan", task,
+    planPath: planPath || null,
+    startedAt: planStartedAt,
+    endedAt: new Date().toISOString(),
+    outcome, summary: summary || "",
+    steps: trail.filter((t) => t.step > 0),
+    approvals: [], filesChanged: [], checkpoint: null,
+    skipped: [] });
   agentPillHide();
   notifyDone("Plan finished",
     "The planning run ended (" + outcome + ").", planT0);
@@ -13096,32 +13460,72 @@ async function openAgentReview(review) {
         return d.error ? null : d.content;
       } catch (e) { return null; }
     }
-    for (const p of approved) originals[p] = await originalOf(p);
+    /* D2: originals come from the run checkpoint when
+       this review belongs to a run (they are the true
+       pre-run contents); anything the run never
+       captured (skipped, or a resumed task) falls back
+       to reading disk now, before anything is applied -
+       the pre-D2 behavior. */
+    const runOriginals = review.runOriginals || {};
+    for (const p of approved)
+      originals[p] = (p in runOriginals) ? runOriginals[p]
+        : await originalOf(p);
     for (const p of approvedDel)
-      deletedOriginals[p] = await originalOf(p);
+      deletedOriginals[p] = (p in runOriginals)
+        ? runOriginals[p] : await originalOf(p);
     let ckptPath = "";
     if (approved.size || approvedDel.size) {
-      ckptPath = checkpointFileName(new Date());
       const payload = buildDiskCheckpoint(review.task || "",
         originals, deletedOriginals);
+      if (review.runCkptPath) {
+        /* The run checkpoint is the run's one undo
+           point: merge every captured original into it
+           (including files the user did not approve -
+           their entries simply match disk) and keep
+           the run's path instead of minting a second
+           checkpoint for the same run. */
+        ckptPath = review.runCkptPath;
+        for (const [p, c] of Object.entries(runOriginals)) {
+          if ((review.deletions || new Set()).has(p)) {
+            if (!(p in payload.deleted))
+              payload.deleted[p] = c;
+          } else if (!(p in payload.files)) {
+            payload.files[p] = c;
+          }
+        }
+        payload.runId = review.runId || null;
+        payload.run = true;
+        payload.skipped = (review.runSkipped || []).slice();
+      } else {
+        ckptPath = checkpointFileName(new Date());
+      }
       const cd = await postJson("/api/file",
         { path: ckptPath, content: JSON.stringify(payload) });
       if (!cd.error) {
         const idx = ckptIndexLoad();
-        idx.unshift({ path: ckptPath, created: payload.created,
-          task: payload.task,
-          files: Object.keys(originals)
-            .concat(Object.keys(deletedOriginals)) });
+        const entry = { path: ckptPath,
+          created: payload.created, task: payload.task,
+          files: Object.keys(payload.files)
+            .concat(Object.keys(payload.deleted)),
+          run: !!payload.run };
+        const at = idx.findIndex((x) =>
+          x.path === ckptPath);
+        if (at >= 0) idx[at] = entry;
+        else idx.unshift(entry);
         ckptIndexSave(idx);
       } else ckptPath = "";
     }
     let n = 0;
+    const appliedChanges = [];
     for (const [p, c] of staged) {
       if (!approved.has(p)) continue;
       const d = await postJson("/api/file",
         { path: p, content: c });
       if (!d.error) {
         n++;
+        appliedChanges.push({ path: p,
+          kind: originals[p] == null ? "created"
+            : "modified" });
         if (p === currentFile) await reloadCurrentFromDisk();
         else if (tabStates.has(p)) tabStates.delete(p);
       }
@@ -13129,7 +13533,10 @@ async function openAgentReview(review) {
     let nd = 0;
     for (const p of approvedDel) {
       const d = await postJson("/api/file/delete", { path: p });
-      if (d && !d.error) nd++;
+      if (d && !d.error) {
+        nd++;
+        appliedChanges.push({ path: p, kind: "deleted" });
+      }
     }
     loadFiles();
     addMsg("SYSTEM", "Agent changes applied: " + n +
@@ -13159,6 +13566,14 @@ async function openAgentReview(review) {
             ". Fix them.");
       }
     } catch (e) { /* verify stays available manually */ }
+    /* D2: the post-run review - what actually landed,
+       with per-file and per-hunk keep/undo against the
+       run checkpoint. */
+    if (ckptPath && appliedChanges.length)
+      openRunReview({ task: review.task || "",
+        runId: review.runId || null, ckptPath,
+        changes: appliedChanges,
+        skipped: (review.runSkipped || []).slice() });
   };
   refreshApply();
   box.appendChild(applyRow);
@@ -13274,6 +13689,260 @@ async function restoreDiskCheckpoint(entry) {
     (payload.task || "agent task") + ").");
 }
 
+/* D2: the post-run review. Lists what a run actually
+   changed on disk - modified / created / deleted -
+   against the run's one checkpoint. KEEP accepts a
+   file for good (its snapshot entry is dropped);
+   UNDO restores it from the checkpoint (created files
+   are removed, deleted files come back); UNDO ALL
+   does that for everything still pending. Per-hunk
+   undo lives in the diff view: each hunk can be
+   reversed on its own, and a hunk whose text no
+   longer matches the file is refused, never guessed. */
+async function openRunReview(ctx) {
+  const box = $("todoResults");
+  $("todoTitle").textContent =
+    "🧾 Run review - keep or undo per file";
+  box.textContent = "";
+  const loadEl = document.createElement("div");
+  loadEl.className = "dim";
+  loadEl.textContent = "Loading the run checkpoint…";
+  box.appendChild(loadEl);
+  $("todoPanel").classList.remove("hidden");
+  let payload = null;
+  try {
+    const r = await fetch("/api/file?path=" +
+      encodeURIComponent(ctx.ckptPath));
+    const d = await r.json();
+    if (!d.error && d.content)
+      payload = JSON.parse(d.content);
+  } catch (e) { /* handled below */ }
+  if (!payload || payload.kind !== "ghostide-checkpoint") {
+    box.textContent = "";
+    const el = document.createElement("div");
+    el.className = "dim";
+    el.textContent = "The run checkpoint is missing (" +
+      ctx.ckptPath + "), so per-file undo is not " +
+      "available for this run.";
+    box.appendChild(el);
+    return;
+  }
+  payload.files = payload.files || {};
+  payload.deleted = payload.deleted || {};
+  const state = new Map();
+  for (const c of ctx.changes || []) {
+    let original;
+    if (c.path in payload.deleted)
+      original = payload.deleted[c.path];
+    else if (c.path in payload.files)
+      original = payload.files[c.path];
+    else continue;
+    state.set(c.path, { kind: c.kind, original, done: "" });
+  }
+  const skipped = (ctx.skipped && ctx.skipped.length)
+    ? ctx.skipped : (payload.skipped || []);
+  async function savePayload() {
+    const left = Object.keys(payload.files).length +
+      Object.keys(payload.deleted).length;
+    if (!left) {
+      await postJson("/api/file/delete",
+        { path: ctx.ckptPath });
+      ckptIndexSave(ckptIndexLoad().filter((x) =>
+        x.path !== ctx.ckptPath));
+      return;
+    }
+    await postJson("/api/file",
+      { path: ctx.ckptPath,
+        content: JSON.stringify(payload) });
+  }
+  function dropEntry(p) {
+    delete payload.files[p];
+    delete payload.deleted[p];
+  }
+  async function refreshEditor(p) {
+    if (p === currentFile) await reloadCurrentFromDisk();
+    else if (tabStates.has(p)) tabStates.delete(p);
+    loadFiles();
+  }
+  async function currentOf(p) {
+    try {
+      const r = await fetch("/api/file?path=" +
+        encodeURIComponent(p));
+      const d = await r.json();
+      return d.error ? "" : (d.content || "");
+    } catch (e) { return ""; }
+  }
+  async function keepFile(p) {
+    const e = state.get(p);
+    if (!e || e.done) return;
+    dropEntry(p);
+    await savePayload();
+    e.done = "kept";
+    addMsg("SYSTEM", "Kept " + p +
+      " - its undo point is dropped.");
+    render();
+  }
+  async function undoFile(p) {
+    const e = state.get(p);
+    if (!e || e.done) return;
+    let ok = false;
+    if (e.kind === "created") {
+      const d = await postJson("/api/file/delete",
+        { path: p });
+      ok = !!(d && !d.error);
+    } else {
+      const d = await postJson("/api/file",
+        { path: p, content: e.original });
+      ok = !!(d && !d.error);
+    }
+    if (!ok) {
+      addMsg("SYSTEM", "Undo failed for " + p + ".");
+      return;
+    }
+    dropEntry(p);
+    await savePayload();
+    e.done = "undone";
+    await refreshEditor(p);
+    addMsg("SYSTEM", "Undid " + p +
+      " - restored from the run checkpoint.");
+    render();
+  }
+  async function undoHunk(p, hunk, host) {
+    const e = state.get(p);
+    if (!e || e.done) return;
+    const current = await currentOf(p);
+    const r = reverseUnifiedHunk(current, hunk);
+    if (!r.ok) {
+      addMsg("SYSTEM", "Hunk undo refused for " + p +
+        ": " + r.error);
+      return;
+    }
+    const d = await postJson("/api/file",
+      { path: p, content: r.content });
+    if (d.error) {
+      addMsg("SYSTEM", "Hunk undo failed for " + p + ".");
+      return;
+    }
+    await refreshEditor(p);
+    if (r.content === e.original) {
+      dropEntry(p);
+      await savePayload();
+      e.done = "undone";
+      addMsg("SYSTEM", "Undid " + p +
+        " - every hunk reversed, file is back to its " +
+        "pre-run content.");
+      render();
+    } else {
+      addMsg("SYSTEM", "One hunk of " + p + " undone.");
+      await showHunks(p, host);
+    }
+  }
+  async function showHunks(p, host) {
+    const e = state.get(p);
+    host.textContent = "";
+    const wait = document.createElement("div");
+    wait.className = "dim";
+    wait.textContent = "Computing diff…";
+    host.appendChild(wait);
+    const current = await currentOf(p);
+    const d = await postJson("/api/diff-text",
+      { path: p, base: e.original == null ? ""
+          : e.original,
+        content: current });
+    pendingRefactor = null;
+    $("diffApply").classList.add("hidden");
+    $("diffDiscard").classList.add("hidden");
+    $("diffTitle").textContent = "Run diff: " + p +
+      " (checkpoint -> now)";
+    $("diffOut").textContent = d.diff || "(no differences)";
+    $("diffPanel").classList.remove("hidden");
+    host.textContent = "";
+    const hunks = parseUnifiedDiff(d.diff || "");
+    if (!hunks.length) {
+      const el = document.createElement("div");
+      el.className = "dim";
+      el.textContent = "   (no hunks - the file matches " +
+        "its checkpoint)";
+      host.appendChild(el);
+      return;
+    }
+    for (const h of hunks) {
+      const row = document.createElement("div");
+      row.className = "findRow";
+      row.textContent = "   ↩ undo hunk @@ -" +
+        h.oldStart + "," + h.oldCount + " +" + h.newStart +
+        "," + h.newCount + " @@";
+      row.onclick = () => undoHunk(p, h, host);
+      host.appendChild(row);
+    }
+  }
+  function render() {
+    box.textContent = "";
+    const head = document.createElement("div");
+    head.className = "dim";
+    head.textContent = "Run: " + (ctx.task || "agent task") +
+      ". Keep drops a file's undo point; Undo restores " +
+      "the pre-run content from " + ctx.ckptPath + ".";
+    box.appendChild(head);
+    const pending = [...state.entries()]
+      .filter(([, e]) => !e.done);
+    if (pending.length > 1) {
+      const all = document.createElement("div");
+      all.className = "findRow";
+      all.textContent = "↩ UNDO ALL (" + pending.length +
+        " file(s) still pending)";
+      all.onclick = async () => {
+        for (const [p] of pending) await undoFile(p);
+      };
+      box.appendChild(all);
+    }
+    if (skipped.length) {
+      const sk = document.createElement("div");
+      sk.className = "dim";
+      sk.textContent = "Not covered by undo (too large " +
+        "or binary when the run touched them): " +
+        skipped.join(", ");
+      box.appendChild(sk);
+    }
+    if (!state.size) {
+      const el = document.createElement("div");
+      el.className = "dim";
+      el.textContent = "Nothing left to review - every " +
+        "change was kept or undone.";
+      box.appendChild(el);
+    }
+    for (const [p, e] of state) {
+      const row = document.createElement("div");
+      row.className = "findRow";
+      row.textContent = (e.done === "kept" ? "✓ kept: "
+        : e.done === "undone" ? "↩ undone: "
+        : e.kind === "created" ? "＋ created: "
+        : e.kind === "deleted" ? "🗑 deleted: "
+        : "✏️ modified: ") + p;
+      box.appendChild(row);
+      if (e.done) continue;
+      const diffRow = document.createElement("div");
+      diffRow.className = "findRow";
+      diffRow.textContent = "   👁 diff + hunks for " + p;
+      const host = document.createElement("div");
+      diffRow.onclick = () => showHunks(p, host);
+      box.appendChild(diffRow);
+      box.appendChild(host);
+      const keepRow = document.createElement("div");
+      keepRow.className = "findRow";
+      keepRow.textContent = "   ✓ KEEP " + p;
+      keepRow.onclick = () => keepFile(p);
+      box.appendChild(keepRow);
+      const undoRow = document.createElement("div");
+      undoRow.className = "findRow";
+      undoRow.textContent = "   ↩ UNDO " + p;
+      undoRow.onclick = () => undoFile(p);
+      box.appendChild(undoRow);
+    }
+  }
+  render();
+}
+
 function openCheckpointsPanel() {
   $("todoTitle").textContent = "🗂 Agent checkpoints";
   const box = $("todoResults");
@@ -13310,7 +13979,81 @@ function openCheckpointsPanel() {
       openCheckpointsPanel();
     };
     box.appendChild(drow);
+    if (entry.path.includes("ckpt-run-")) {
+      /* D2: a run checkpoint can be re-opened as the
+         post-run review (per-file / per-hunk undo)
+         any time, not just right after the apply. */
+      const vrow = document.createElement("div");
+      vrow.className = "findRow";
+      vrow.textContent = "   🧾 Review run changes " +
+        "(keep / undo per file)";
+      vrow.onclick = async () => {
+        let payload = null;
+        try {
+          const r = await fetch("/api/file?path=" +
+            encodeURIComponent(entry.path));
+          const d = await r.json();
+          if (!d.error && d.content)
+            payload = JSON.parse(d.content);
+        } catch (e) { /* reported by the review */ }
+        const changes = [];
+        if (payload) {
+          for (const [p, c] of
+              Object.entries(payload.files || {}))
+            changes.push({ path: p,
+              kind: c == null ? "created" : "modified" });
+          for (const p of
+              Object.keys(payload.deleted || {}))
+            changes.push({ path: p, kind: "deleted" });
+        }
+        openRunReview({ task: entry.task || "",
+          ckptPath: entry.path, changes,
+          skipped: (payload && payload.skipped) || [] });
+      };
+      box.appendChild(vrow);
+    }
   }
+  /* D2: recent run records (server-side, one JSON per
+     run) - the list the later supervision work reads. */
+  const runsHead = document.createElement("div");
+  runsHead.className = "dim";
+  runsHead.textContent = "🤖 Recent agent runs";
+  box.appendChild(runsHead);
+  const runsBox = document.createElement("div");
+  const runsWait = document.createElement("div");
+  runsWait.className = "dim";
+  runsWait.textContent = "Loading run records…";
+  runsBox.appendChild(runsWait);
+  box.appendChild(runsBox);
+  fetch("/api/agent-runs").then((r) => r.json())
+    .then((d) => {
+      runsBox.textContent = "";
+      const runs = (d && d.runs) || [];
+      if (!runs.length) {
+        const el = document.createElement("div");
+        el.className = "dim";
+        el.textContent = "No run records yet. One is " +
+          "saved each time an agent or plan run ends.";
+        runsBox.appendChild(el);
+        return;
+      }
+      for (const run of runs.slice(0, 10)) {
+        const row = document.createElement("div");
+        row.className = "findRow";
+        row.textContent = (run.mode === "plan" ? "📝 " : "🤖 ") +
+          (run.endedAt || run.startedAt || "") + " - " +
+          (run.task || "agent task") + " (" +
+          (run.outcome || "?") + ", " + run.files +
+          " file(s))";
+        runsBox.appendChild(row);
+      }
+    }).catch(() => {
+      runsBox.textContent = "";
+      const el = document.createElement("div");
+      el.className = "dim";
+      el.textContent = "Run records unavailable.";
+      runsBox.appendChild(el);
+    });
   $("todoPanel").classList.remove("hidden");
 }
 /* ---------------- Roadmap G6: test runner ---------------- */
