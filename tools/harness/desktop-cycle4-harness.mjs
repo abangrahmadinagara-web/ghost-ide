@@ -30,8 +30,8 @@ ck("D8 version: desktop train agreement (3.14.0 at D8), phone train untouched",
    vjson.version === vjson.desktop.version &&
    vjson.latest === "3.10.1" &&
    vjson.android && vjson.android.version === "3.10.1");
-ck("D8 route census re-derived: 190 (183 + 7 model store routes in D6)",
-   (py.match(/parsed\.path ==/g) || []).length === 190);
+ck("D8 route census re-derived: 194 (190 + 4 git depth routes in D9)",
+   (py.match(/parsed\.path ==/g) || []).length === 194);
 ck("D8 server: policy store lives in the workspace .ghostide folder",
    py.includes('def mcp_policy_path():') &&
    py.includes('WORKSPACE / ".ghostide" / "mcp-policy.json"'));

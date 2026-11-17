@@ -28,7 +28,7 @@ WORKSPACE = Path(os.environ.get(
     "GHOST_IDE_WORKSPACE", ROOT / "playground")).resolve()
 PORT = int(os.environ.get("GHOST_IDE_PORT", "5173"))
 HOST = os.environ.get("GHOST_IDE_HOST", "127.0.0.1")
-APP_VERSION = "3.16.0"
+APP_VERSION = "3.17.0"
 FROZEN = getattr(sys, "frozen", False)
 
 # Desktop Cycle 1 (v3.11.0): portable mode, the desktop
@@ -4799,6 +4799,252 @@ def git_scope(ws):
     return {"ok": True, "output": body}
 
 
+# ------------- Desktop Cycle 3, D9: git depth -------------
+# Hunk staging and the three-pane conflict editor's data.
+# Everything runs through git_out / the same subprocess
+# discipline as the other git routes; patches fed to
+# git apply arrive on stdin as one argv-built command,
+# never as shell strings, and paths are validated with
+# safe_path before they reach git.
+
+_HUNK_HDR_RE = _re_mod.compile(
+    r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
+
+
+def _is_conflict_xy(x, y):
+    """Porcelain v1 XY pair marking an unmerged path."""
+    return x == "U" or y == "U" or (x, y) in (("A", "A"),
+                                              ("D", "D"))
+
+
+def _split_diff(diff_text):
+    """Split one file's unified diff into (header lines,
+    hunks). Each hunk carries a sha fingerprint of its
+    header + body so a selection made against a stale
+    diff can be refused, never applied blind."""
+    import hashlib
+    header = []
+    hunks = []
+    cur = None
+    for ln in diff_text.splitlines():
+        if _HUNK_HDR_RE.match(ln):
+            if cur is not None:
+                hunks.append(cur)
+            cur = {"header": ln, "lines": []}
+        elif cur is None:
+            header.append(ln)
+        else:
+            cur["lines"].append(ln)
+    if cur is not None:
+        hunks.append(cur)
+    for h in hunks:
+        h["text"] = "\n".join([h["header"]] + h["lines"])
+        h["sha"] = hashlib.sha256(
+            h["text"].encode("utf-8")).hexdigest()
+    return header, hunks
+
+
+def _file_diff(path, cached):
+    args = ["diff", "--no-color"]
+    if cached:
+        args.append("--cached")
+    args += ["--", path]
+    rc, out, err, _ = git_out(args)
+    if rc != 0:
+        raise ValueError(err.strip()[:300]
+                         or "git diff failed")
+    return out
+
+
+def git_hunks(path, area):
+    """Structured hunks for one file and area (worktree =
+    unstaged changes, index = staged changes). Binary
+    files carry no hunks: the client labels them
+    file-level only."""
+    safe_path(path)
+    diff = _file_diff(path, area == "index")
+    header, hunks = _split_diff(diff)
+    binary = any(ln.startswith("Binary files")
+                 for ln in header)
+    return {"path": path, "area": area, "binary": binary,
+            "headers": [h["header"] for h in hunks],
+            "hunks": [{"index": i, "header": h["header"],
+                       "text": h["text"], "sha": h["sha"]}
+                      for i, h in enumerate(hunks)]}
+
+
+def _git_apply(patch, cached=False, reverse=False):
+    if not shutil.which("git"):
+        raise ValueError("git is not installed")
+    args = ["git", "-C", str(WORKSPACE), "apply"]
+    if cached:
+        args.append("--cached")
+    if reverse:
+        args.append("--reverse")
+    try:
+        r = subprocess.run(args, cwd=str(WORKSPACE),
+                           input=patch, capture_output=True,
+                           text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        raise ValueError("git apply timed out")
+    if r.returncode != 0:
+        raise ValueError(
+            (r.stderr or r.stdout).strip()[:300]
+            or "git apply failed")
+
+
+def git_apply_hunks(path, area, action, indices, expect):
+    """Stage, unstage or discard selected hunks of one
+    file. The client echoes back the hunk headers it saw
+    and the fingerprint of each hunk it selected (the
+    expect block from /api/git/hunks); the diff is
+    re-read here and any drift refuses the whole
+    operation before git apply runs, so a stale selection
+    is never applied blind."""
+    safe_path(path)
+    if action not in ("stage", "unstage", "discard"):
+        raise ValueError("unknown hunk action")
+    if action == "stage" and area != "worktree":
+        raise ValueError(
+            "staging applies to unstaged hunks")
+    if action == "unstage" and area != "index":
+        raise ValueError(
+            "unstaging applies to staged hunks")
+    if action == "discard" and area != "worktree":
+        raise ValueError(
+            "discarding applies to unstaged hunks")
+    diff = _file_diff(path, area == "index")
+    header, hunks = _split_diff(diff)
+    exp = expect or {}
+    stale = ("the diff changed since you loaded it - "
+             "refresh and pick the hunks again")
+    if exp.get("headers") != [h["header"] for h in hunks]:
+        raise ValueError(stale)
+    want_sel = {}
+    for k, v in (exp.get("selected") or {}).items():
+        want_sel[str(k)] = v
+    sel = []
+    seen = set()
+    for i in indices or []:
+        if not isinstance(i, int) or isinstance(i, bool) \
+                or i < 0 or i >= len(hunks) or i in seen:
+            raise ValueError("bad hunk selection")
+        seen.add(i)
+        if want_sel.get(str(i)) != hunks[i]["sha"]:
+            raise ValueError(stale)
+        sel.append(hunks[i])
+    if not sel:
+        raise ValueError("no hunks selected")
+    patch = "\n".join(
+        header + [h["text"] for h in sel]) + "\n"
+    if action == "stage":
+        _git_apply(patch, cached=True)
+    elif action == "unstage":
+        _git_apply(patch, cached=True, reverse=True)
+    else:
+        _git_apply(patch, reverse=True)
+    return {"ok": True}
+
+
+def _git_dir():
+    rc, out, err, _ = git_out(["rev-parse", "--git-dir"])
+    if rc != 0:
+        return None
+    d = Path(out.strip())
+    if not d.is_absolute():
+        d = WORKSPACE / d
+    return d
+
+
+def git_merge_state():
+    """The in-progress operation, read from .git state:
+    merge, rebase, cherry-pick or revert, else None.
+    Rebase is checked first: a rebase can also leave a
+    CHERRY_PICK_HEAD behind while it runs."""
+    gd = _git_dir()
+    if gd is None:
+        return None
+    if (gd / "rebase-merge").is_dir() \
+            or (gd / "rebase-apply").is_dir():
+        return "rebase"
+    if (gd / "MERGE_HEAD").is_file():
+        return "merge"
+    if (gd / "CHERRY_PICK_HEAD").is_file():
+        return "cherry-pick"
+    if (gd / "REVERT_HEAD").is_file():
+        return "revert"
+    return None
+
+
+def git_conflict_paths():
+    rc, out, err, _ = git_out(
+        ["status", "--porcelain=v1"])
+    if rc != 0:
+        return []
+    paths = []
+    for ln in out.splitlines():
+        if len(ln) > 3 and _is_conflict_xy(ln[0], ln[1]):
+            paths.append(ln[3:].strip())
+    return paths
+
+
+def git_conflict(path):
+    """Base / ours / theirs stage contents plus the
+    working file for one conflicted path, for the
+    three-pane editor. A stage that does not exist in
+    this conflict (the base of an add/add, say) comes
+    back None, never an error."""
+    safe_path(path)
+    rc, out, err, _ = git_out(["ls-files", "-u", "--", path])
+    if rc != 0:
+        raise ValueError(err.strip()[:300]
+                         or "git ls-files failed")
+    stages = set()
+    for ln in out.splitlines():
+        parts = ln.split()
+        if len(parts) >= 3:
+            try:
+                stages.add(int(parts[2]))
+            except ValueError:
+                pass
+    if not stages:
+        raise ValueError("no conflict recorded for " + path)
+    texts = {}
+    for n, key in ((1, "base"), (2, "ours"),
+                   (3, "theirs")):
+        if n in stages:
+            rc, out, err, _ = git_out(
+                ["show", ":%d:%s" % (n, path)])
+            texts[key] = out if rc == 0 else None
+        else:
+            texts[key] = None
+    wp = safe_path(path)
+    working = None
+    if wp.is_file():
+        working = wp.read_text(encoding="utf-8",
+                               errors="replace")
+    return {"path": path, "stages": sorted(stages),
+            "base": texts["base"], "ours": texts["ours"],
+            "theirs": texts["theirs"], "working": working}
+
+
+def git_conflict_resolve(path, content):
+    """Write the resolved content and stage it (git
+    add). Returns how many conflicted files remain, so
+    the panel can say when the operation is ready to
+    commit. Nothing here commits or continues: that
+    stays the user's step."""
+    p = safe_path(path)
+    p.write_text(content, encoding="utf-8")
+    rc, out, err, _ = git_out(["add", "--", path])
+    if rc != 0:
+        raise ValueError(err.strip()[:300]
+                         or "git add failed")
+    return {"ok": True,
+            "remaining": len(git_conflict_paths()),
+            "mergeState": git_merge_state()}
+
+
 # ---------------- GhostMCP client (v2.44) ----------------
 def mcp_config_path():
     """Workspace .mcp.json / mcp.json first, then the user's
@@ -7588,10 +7834,19 @@ class Handler(SimpleHTTPRequestHandler):
                                          if ln.strip()])
                 except Exception:
                     stash_n = 0
+                # D9 (Desktop Cycle 3): unmerged paths
+                # and any in-progress merge / rebase /
+                # cherry-pick ride the same status the
+                # panel already polls.
+                conflicts = [c["path"] for c in changes
+                             if _is_conflict_xy(c["index"],
+                                                c["worktree"])]
                 return self.send_json({"repo": True, "branch": branch,
                                        "ahead": ahead, "behind": behind,
                                        "changes": changes,
                                        "stash": stash_n,
+                                       "conflicts": conflicts,
+                                       "mergeState": git_merge_state(),
                                        "scope_line": scope_line})
             if parsed.path == "/api/git/remote":
                 rc, out, err, _ = git_out(["remote"])
@@ -7616,6 +7871,23 @@ class Handler(SimpleHTTPRequestHandler):
                 if rc != 0:
                     raise ValueError(err.strip()[:300] or "git diff failed")
                 return self.send_json({"path": rel, "diff": out})
+            if parsed.path == "/api/git/hunks":
+                # D9: one file's diff as structured
+                # hunks for hunk staging. area=worktree
+                # is the unstaged diff, area=index the
+                # staged one.
+                qs = urllib.parse.parse_qs(parsed.query)
+                rel = (qs.get("path") or [""])[0]
+                area = (qs.get("area") or ["worktree"])[0]
+                if area not in ("worktree", "index"):
+                    raise ValueError("bad area")
+                return self.send_json(git_hunks(rel, area))
+            if parsed.path == "/api/git/conflict":
+                # D9: base / ours / theirs + the working
+                # file for the three-pane conflict editor.
+                qs = urllib.parse.parse_qs(parsed.query)
+                rel = (qs.get("path") or [""])[0]
+                return self.send_json(git_conflict(rel))
             if parsed.path == "/api/git/log":
                 rc, out, err, _ = git_out(["log", "--oneline", "-20"])
                 if rc != 0:
@@ -8697,6 +8969,29 @@ class Handler(SimpleHTTPRequestHandler):
                 if rc != 0:
                     raise ValueError(err.strip()[:300] or "git add failed")
                 return self.send_json({"ok": True})
+            if parsed.path == "/api/git/hunks/apply":
+                # D9: stage / unstage / discard the
+                # selected hunks only. The expect block
+                # is the stale-selection guard: the diff
+                # is re-read and any drift refuses.
+                data = self.read_json()
+                return self.send_json(git_apply_hunks(
+                    data.get("path") or "",
+                    data.get("area") or "worktree",
+                    data.get("action") or "",
+                    data.get("hunks") or [],
+                    data.get("expect") or {}))
+            if parsed.path == "/api/git/conflict/resolve":
+                # D9: save the conflict editor's result
+                # and stage it. Committing or continuing
+                # the operation stays the user's step.
+                data = self.read_json()
+                content = data.get("content")
+                if not isinstance(content, str):
+                    raise ValueError(
+                        "resolved content missing")
+                return self.send_json(git_conflict_resolve(
+                    data.get("path") or "", content))
             if parsed.path == "/api/git/checkout":
                 # Discard a file's uncommitted changes (VS Code's
                 # per-file Revert). Staged or not, back to HEAD.

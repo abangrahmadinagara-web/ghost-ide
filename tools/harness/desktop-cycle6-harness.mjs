@@ -24,14 +24,14 @@ let passed = 0, failed = 0;
 const ck = (n, c) => { console.log((c ? "PASS " : "FAIL ") + n); c ? passed++ : failed++; };
 
 /* ---------- static pins ---------- */
-ck("D6 version: desktop train at 3.16.0, phone train untouched",
-   vjson.desktop && vjson.desktop.version === "3.16.0" &&
-   py.includes('APP_VERSION = "3.16.0"') &&
-   vjson.version === "3.16.0" &&
+ck("D6 version: desktop train agreement (3.16.0 at D6), phone train untouched",
+   vjson.desktop && vjson.desktop.version !== "3.10.1" &&
+   py.includes('APP_VERSION = "' + vjson.desktop.version + '"') &&
+   vjson.version === vjson.desktop.version &&
    vjson.latest === "3.10.1" &&
    vjson.android && vjson.android.version === "3.10.1");
-ck("D6 route census re-derived: 190 (183 + 7 model store routes)",
-   (py.match(/parsed\.path ==/g) || []).length === 190);
+ck("D6 route census re-derived: 194 (190 + 4 git depth routes in D9)",
+   (py.match(/parsed\.path ==/g) || []).length === 194);
 ck("D6 server: catalog pins for the full Qwen2.5-Coder family",
    py.includes('"bytes": 491400064') &&
    py.includes("1d9614638d18024d0fbb36575a15f1302a3adf044") &&
@@ -131,8 +131,8 @@ try {
   }
   if (!up) throw new Error("server did not come up:\n" + serverLog);
   const health = await call("GET", "/api/health");
-  ck("E2E server reports 3.16.0",
-     health.data.version === "3.16.0");
+  ck("E2E server reports the desktop train version",
+     health.data.version === vjson.desktop.version);
 
   const st = await call("GET", "/api/models/store");
   const cards = {};

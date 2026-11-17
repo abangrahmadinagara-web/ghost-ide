@@ -4,10 +4,10 @@
  },
  "desktop": {
   "manifest": "https://downloads.ghostdeveloperstudio.com/latest.json",
-  "version": "3.16.0"
+  "version": "3.17.0"
  },
  "latest": "3.10.1",
- "notes": "Desktop 3.16.0 (Desktop Cycle 3, D6): a model store. The full Qwen2.5-Coder catalog (0.5B, 1.5B, 3B, 7B, each size and SHA-256 pinned and verified on download) plus the embedding model in one store view, with machine-fit guidance from this machine's RAM (estimates, labelled as estimates, never blocking), download progress with pause (keeps the partial file, resumes by Range) and cancel, delete with a loaded-model guard, disk usage, and custom GGUF import from a local file or a URL (header checked, SHA-256 recorded, labelled Imported by you, source not verified). Desktop 3.15.0 added the neural embeddings index (local embedding model, Find panel Neural mode, agent SEMANTIC action). Android stays 3.10.1; its next release re-syncs the shared version train.",
+ "notes": "Desktop 3.17.0 (Desktop Cycle 3, D9): git depth. Hunk staging in the diff view: stage, unstage or discard individual hunks, with a stale-selection guard that re-reads the diff and refuses if it changed since it was loaded. A three-pane conflict editor: base, ours and theirs panes beside an editable result, per-conflict Use ours / Use theirs / Use both buttons, a live conflicts-remaining counter, and save (write + stage) blocked while markers remain unless explicitly overridden; the Git panel banners merge, rebase and cherry-pick state and says when the operation is ready to commit, without ever committing or continuing for you. Desktop 3.16.0 added the model store. Android stays 3.10.1; its next release re-syncs the shared version train.",
  "url": "https://github.com/littlestjames82-sys/ghost-ide/releases",
- "version": "3.16.0"
+ "version": "3.17.0"
 }

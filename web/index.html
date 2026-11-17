@@ -79,6 +79,7 @@ setTimeout(function () {
     <div id="gitPanel">
       <div class="panel-head"><span id="gitHeadTxt">GIT</span> <span id="gitBranch" class="tag"></span> <button id="gitCopyStatus" title="Copy a one-line status summary (branch, distance, change count)">📋</button></div>
       <div id="gitChanges" class="dim">checking…</div>
+      <div id="gitMergeState" class="dim"></div>
       <div class="git-remote">
         <div class="dim">Branches</div>
         <div id="branchList" class="dim"></div>
@@ -829,6 +830,23 @@ setTimeout(function () {
     <button id="diffDiscard" class="hidden">Discard</button>
     <button id="diffClose">✕</button></span></div>
   <pre id="diffOut"></pre>
+  <div id="diffHunks"></div>
+</div>
+
+<div id="conflictPanel" class="hidden">
+  <div class="run-head"><span id="conflictTitle">Resolve conflict</span>
+    <span><button id="conflictSave">Save resolved + stage</button>
+    <button id="conflictClose">✕</button></span></div>
+  <div id="conflictPanes">
+    <div><div class="dim">Base (common ancestor)</div><pre id="conflictBase"></pre></div>
+    <div><div class="dim">Ours (current branch)</div><pre id="conflictOurs"></pre></div>
+    <div><div class="dim">Theirs (incoming)</div><pre id="conflictTheirs"></pre></div>
+  </div>
+  <div id="conflictBlocks"></div>
+  <div class="dim">Result: use the buttons above per conflict, or edit the text by hand.</div>
+  <textarea id="conflictResult" rows="12" spellcheck="false"></textarea>
+  <div id="conflictCount" class="dim"></div>
+  <div id="conflictMsg" class="dim"></div>
 </div>
 <div id="settingsPanel" class="hidden">
   <h3>Settings</h3>

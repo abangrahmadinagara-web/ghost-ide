@@ -32,8 +32,8 @@ ck("D5 version: desktop train agreement (3.15.0 at D5), phone train untouched",
    vjson.version === vjson.desktop.version &&
    vjson.latest === "3.10.1" &&
    vjson.android && vjson.android.version === "3.10.1");
-ck("D5 route census re-derived: 190 (183 + 7 model store routes in D6)",
-   (py.match(/parsed\.path ==/g) || []).length === 190);
+ck("D5 route census re-derived: 194 (190 + 4 git depth routes in D9)",
+   (py.match(/parsed\.path ==/g) || []).length === 194);
 ck("D5 server: model pin is the real nomic asset (size + sha256)",
    py.includes('"nomic-embed-text-v1.5.Q8_0.gguf"') &&
    py.includes('"bytes": 146146432') &&

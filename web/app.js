@@ -36904,6 +36904,8 @@
         if (sc) sc.textContent = "";
         const tl = $("tagList");
         if (tl) tl.textContent = "";
+        const msn = $("gitMergeState");
+        if (msn) msn.textContent = "";
         $("gitAiMsg").disabled = true;
         $("branchChip").classList.add("hidden");
         box.innerHTML = "";
@@ -36927,6 +36929,29 @@
       const scopeEl = $("gitScopeLine");
       if (scopeEl)
         scopeEl.textContent = d.scope_line ? "Last Scope: " + d.scope_line : "";
+      const msEl = $("gitMergeState");
+      if (msEl) {
+        const msNames = {
+          "merge": "Merge",
+          "rebase": "Rebase",
+          "cherry-pick": "Cherry-pick",
+          "revert": "Revert"
+        };
+        const nConf = (d.conflicts || []).length;
+        if (d.mergeState && nConf) {
+          msEl.textContent = "\u26A0 " + (msNames[d.mergeState] || "Operation") + " in progress: " + nConf + " conflicted file" + (nConf === 1 ? "" : "s") + " to resolve below.";
+        } else if (d.mergeState === "merge") {
+          msEl.textContent = "Merge in progress: all conflicts resolved, ready to commit.";
+        } else if (d.mergeState === "rebase") {
+          msEl.textContent = "Rebase in progress: all conflicts resolved. Next step: run git rebase --continue in a terminal.";
+        } else if (d.mergeState === "cherry-pick") {
+          msEl.textContent = "Cherry-pick in progress: all conflicts resolved, ready to commit (or git cherry-pick --continue in a terminal).";
+        } else if (d.mergeState === "revert") {
+          msEl.textContent = "Revert in progress: all conflicts resolved, ready to commit.";
+        } else {
+          msEl.textContent = "";
+        }
+      }
       renderWorktrees();
       renderBranches();
       renderStashes();
@@ -36946,12 +36971,21 @@
         row.className = "gitRow";
         const staged = c.index !== " " && c.index !== "?";
         const untracked = c.index === "?" && c.worktree === "?";
+        const conflicted = c.index === "U" || c.worktree === "U" || c.index === "A" && c.worktree === "A" || c.index === "D" && c.worktree === "D";
         const label = document.createElement("span");
         label.textContent = c.path + " ";
         const tag = document.createElement("em");
-        tag.textContent = untracked ? "untracked" : staged ? "staged" : "modified";
+        tag.textContent = conflicted ? "conflict" : untracked ? "untracked" : staged ? "staged" : "modified";
         label.appendChild(tag);
         row.appendChild(label);
+        if (conflicted) {
+          const rsb = document.createElement("button");
+          rsb.textContent = "Resolve";
+          rsb.onclick = () => openConflict(c.path);
+          row.appendChild(rsb);
+          box.appendChild(row);
+          continue;
+        }
         if (!staged) {
           const b = document.createElement("button");
           b.textContent = "Stage";
@@ -37051,8 +37085,260 @@
     $("diffTitle").textContent = "Diff: " + path;
     $("diffOut").textContent = d.error || d.diff || "(no diff - file may be untracked)";
     $("diffPanel").classList.remove("hidden");
+    renderHunks(path);
   }
   $("diffClose").onclick = () => $("diffPanel").classList.add("hidden");
+  async function renderHunks(path) {
+    const box = $("diffHunks");
+    if (!box) return;
+    box.textContent = "";
+    for (const area of ["worktree", "index"]) {
+      let d = null;
+      try {
+        const r = await fetch("/api/git/hunks?path=" + encodeURIComponent(path) + "&area=" + area);
+        d = await r.json();
+      } catch (e) {
+        d = null;
+      }
+      if (!d || d.error) continue;
+      if (d.binary) {
+        if (area === "worktree") {
+          const note = document.createElement("div");
+          note.className = "dim";
+          note.textContent = "Binary file: hunk staging does not apply. Use the file-level Stage button in the Git panel.";
+          box.appendChild(note);
+        }
+        continue;
+      }
+      if (!d.hunks.length) continue;
+      const head = document.createElement("div");
+      head.className = "dim";
+      head.textContent = area === "worktree" ? "Unstaged hunks" : "Staged hunks";
+      box.appendChild(head);
+      for (const h of d.hunks) {
+        const block = document.createElement("div");
+        block.className = "hunkBlock";
+        const hrow = document.createElement("div");
+        hrow.className = "hunkHead";
+        const hlab = document.createElement("span");
+        hlab.textContent = h.header;
+        hrow.appendChild(hlab);
+        if (area === "worktree") {
+          const sb = document.createElement("button");
+          sb.textContent = "Stage hunk";
+          sb.onclick = () => applyHunks(path, d, [h.index], "stage");
+          hrow.appendChild(sb);
+          const db = document.createElement("button");
+          db.textContent = "Discard hunk";
+          db.onclick = () => {
+            if (!confirm("Discard these changes? This cannot be undone from here")) return;
+            applyHunks(path, d, [h.index], "discard");
+          };
+          hrow.appendChild(db);
+        } else {
+          const ub = document.createElement("button");
+          ub.textContent = "Unstage hunk";
+          ub.onclick = () => applyHunks(path, d, [h.index], "unstage");
+          hrow.appendChild(ub);
+        }
+        block.appendChild(hrow);
+        const pre = document.createElement("pre");
+        pre.textContent = h.text;
+        block.appendChild(pre);
+        box.appendChild(block);
+      }
+    }
+  }
+  async function applyHunks(path, d, indices, action) {
+    const selected = {};
+    for (const i2 of indices) {
+      const h = d.hunks.find((x) => x.index === i2);
+      if (h) selected[i2] = h.sha;
+    }
+    const r = await postJson("/api/git/hunks/apply", {
+      path,
+      area: d.area,
+      action,
+      hunks: indices,
+      expect: { headers: d.headers, selected }
+    });
+    if (r.error) alert(r.error);
+    showDiff(path);
+    refreshGit();
+    loadFiles();
+  }
+  var conflictPath = null;
+  function splitConflictBlocks(text) {
+    const lines = text.split("\n");
+    const segs = [];
+    let buf = [];
+    let i2 = 0;
+    const flush = () => {
+      if (buf.length) {
+        segs.push({ kind: "text", text: buf.join("\n") });
+        buf = [];
+      }
+    };
+    while (i2 < lines.length) {
+      if (lines[i2].startsWith("<<<<<<<")) {
+        const raw = [lines[i2]];
+        const ours = [];
+        const theirs = [];
+        let side = 0;
+        i2++;
+        let closed = false;
+        while (i2 < lines.length) {
+          const ln = lines[i2];
+          raw.push(ln);
+          i2++;
+          if (ln.startsWith(">>>>>>>")) {
+            closed = true;
+            break;
+          }
+          if (ln.startsWith("|||||||") && side === 0) {
+            side = 1;
+            continue;
+          }
+          if (ln.startsWith("=======") && side < 2) {
+            side = 2;
+            continue;
+          }
+          if (side === 0) ours.push(ln);
+          else if (side === 2) theirs.push(ln);
+        }
+        if (!closed) {
+          buf.push.apply(buf, raw);
+          break;
+        }
+        flush();
+        segs.push({
+          kind: "conflict",
+          ours: ours.join("\n"),
+          theirs: theirs.join("\n"),
+          raw: raw.join("\n")
+        });
+      } else {
+        buf.push(lines[i2]);
+        i2++;
+      }
+    }
+    flush();
+    return segs;
+  }
+  function countConflictBlocks(text) {
+    return splitConflictBlocks(text).filter((s) => s.kind === "conflict").length;
+  }
+  function renderConflictBlocks() {
+    const box = $("conflictBlocks");
+    if (!box) return;
+    box.textContent = "";
+    const segs = splitConflictBlocks(
+      $("conflictResult").value
+    );
+    const blocks = segs.map((s, idx) => ({ s, idx })).filter((x) => x.s.kind === "conflict");
+    blocks.forEach((x, n) => {
+      const row = document.createElement("div");
+      row.className = "conflictRow";
+      const lab = document.createElement("span");
+      lab.textContent = "Conflict " + (n + 1) + " of " + blocks.length + ":";
+      row.appendChild(lab);
+      const choices = [
+        ["Use ours", "ours"],
+        ["Use theirs", "theirs"],
+        ["Use both (ours first)", "ours-theirs"],
+        ["Use both (theirs first)", "theirs-ours"]
+      ];
+      for (const pair2 of choices) {
+        const b = document.createElement("button");
+        b.textContent = pair2[0];
+        b.onclick = () => applyConflictChoice(x.idx, pair2[1]);
+        row.appendChild(b);
+      }
+      box.appendChild(row);
+    });
+    updateConflictCount();
+  }
+  function applyConflictChoice(segIdx, choice) {
+    const ta = $("conflictResult");
+    const segs = splitConflictBlocks(ta.value);
+    const seg = segs[segIdx];
+    if (!seg || seg.kind !== "conflict") {
+      $("conflictMsg").textContent = "That conflict block is no longer in the result; the list has been refreshed.";
+      renderConflictBlocks();
+      return;
+    }
+    let repl;
+    if (choice === "ours") repl = seg.ours;
+    else if (choice === "theirs") repl = seg.theirs;
+    else {
+      const parts = choice === "ours-theirs" ? [seg.ours, seg.theirs] : [seg.theirs, seg.ours];
+      repl = parts.filter((s) => s !== "").join("\n");
+    }
+    segs[segIdx] = { kind: "text", text: repl };
+    ta.value = segs.map((s) => s.kind === "text" ? s.text : s.raw).join("\n");
+    renderConflictBlocks();
+  }
+  function updateConflictCount() {
+    const ta = $("conflictResult");
+    const el = $("conflictCount");
+    if (!ta || !el) return;
+    const n = countConflictBlocks(ta.value);
+    el.textContent = "Conflicts remaining: " + n;
+    const msg = $("conflictMsg");
+    if (msg) {
+      msg.textContent = n ? "Saving is blocked while conflict markers remain, unless you override on the save prompt (a hand-resolved file can legitimately contain marker-like text)." : "";
+    }
+  }
+  async function openConflict(path) {
+    let d = null;
+    try {
+      const r = await fetch("/api/git/conflict?path=" + encodeURIComponent(path));
+      d = await r.json();
+    } catch (e) {
+      d = null;
+    }
+    if (!d || d.error) {
+      alert(d && d.error || "Could not load the conflict.");
+      return;
+    }
+    conflictPath = path;
+    $("conflictTitle").textContent = "Resolve conflict: " + path;
+    $("conflictBase").textContent = d.base == null ? "(no base version in this conflict)" : d.base;
+    $("conflictOurs").textContent = d.ours == null ? "(no version on the current branch)" : d.ours;
+    $("conflictTheirs").textContent = d.theirs == null ? "(no incoming version)" : d.theirs;
+    $("conflictResult").value = d.working || "";
+    $("conflictPanel").classList.remove("hidden");
+    renderConflictBlocks();
+  }
+  $("conflictClose").onclick = () => $("conflictPanel").classList.add("hidden");
+  $("conflictResult").addEventListener("input", () => {
+    renderConflictBlocks();
+  });
+  $("conflictSave").onclick = async () => {
+    if (!conflictPath) return;
+    const text = $("conflictResult").value;
+    const n = countConflictBlocks(text);
+    if (n > 0) {
+      if (!confirm(n + " conflict block" + (n === 1 ? " is" : "s are") + " still in the result. Save anyway? Only do this if the file is meant to contain marker-like text.")) {
+        $("conflictMsg").textContent = "Not saved: " + n + " conflict block" + (n === 1 ? "" : "s") + " remain. Resolve them above or edit the result by hand.";
+        return;
+      }
+    }
+    const d = await postJson(
+      "/api/git/conflict/resolve",
+      { path: conflictPath, content: text }
+    );
+    if (d.error) {
+      alert(d.error);
+      return;
+    }
+    $("conflictPanel").classList.add("hidden");
+    if (conflictPath === currentFile)
+      reloadCurrentFromDisk();
+    conflictPath = null;
+    refreshGit();
+    loadFiles();
+  };
   function ghToken() {
     const el = $("ghToken");
     return el ? el.value.trim() : "";
