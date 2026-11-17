@@ -39,6 +39,20 @@ Settings ("Download 7B model"), switch models any time
 with a GGUF path in Settings or `GHOST_IDE_MODEL`, or use
 the in-app model switcher.
 
+Desktop 3.16.0 adds a model store (Tools, or Settings,
+"Open the model store"): all four sizes as Q4_K_M
+downloads (0.5B 0.46 GB, 1.5B 1.04 GB, 3B 1.96 GB, 7B
+4.36 GB) plus the nomic embedding model, one card each
+with an estimated RAM figure and a fit mark read from
+this machine's actual RAM (guidance only, never a
+block), download progress with pause (the partial file
+is kept and resumed) and cancel, delete with a guard
+for the loaded model, a disk usage line, and custom
+GGUF import from a local file or a web address.
+Imported models are labelled "Imported by you": the
+GGUF header is checked and the SHA-256 recorded at
+import, and the source is not verified by GhostIDE.
+
 ## Run it
 
 From source (needs Python 3.11+ and a llama.cpp build):

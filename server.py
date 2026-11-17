@@ -28,7 +28,7 @@ WORKSPACE = Path(os.environ.get(
     "GHOST_IDE_WORKSPACE", ROOT / "playground")).resolve()
 PORT = int(os.environ.get("GHOST_IDE_PORT", "5173"))
 HOST = os.environ.get("GHOST_IDE_HOST", "127.0.0.1")
-APP_VERSION = "3.15.0"
+APP_VERSION = "3.16.0"
 FROZEN = getattr(sys, "frozen", False)
 
 # Desktop Cycle 1 (v3.11.0): portable mode, the desktop
@@ -734,7 +734,62 @@ def backup_decrypt(passphrase, text):
     return _bk_crypt(enc_key, nonce, ct)
 
 
+# The chat model catalog. Every entry is pinned by exact
+# size + SHA-256 and downloads verify both before the file
+# becomes a model (see _dl_worker). Pin provenance: the
+# sizes and hashes are the HuggingFace LFS metadata for
+# the files above, confirmed against real downloads of
+# each asset (the 7B pin predates the store; the 0.5B,
+# 1.5B and 3B pins were verified byte for byte in the
+# Desktop Cycle 3 D6 build). The name/params/quant/ram_gb/
+# blurb fields are the model store's card data (D6): one
+# source, so a card can never drift from the downloader's
+# pins. ram_gb is an ESTIMATE of the total RAM the model
+# needs at this IDE's 8192-token context, labelled as an
+# estimate wherever it is shown.
 MODEL_CATALOG = {
+    "0.5b": {
+        "file": "qwen2.5-coder-0.5b-instruct-q4_k_m.gguf",
+        "url": "https://huggingface.co/Qwen/"
+               "Qwen2.5-Coder-0.5B-Instruct-GGUF/resolve/main/"
+               "qwen2.5-coder-0.5b-instruct-q4_k_m.gguf",
+        "bytes": 491400064,
+        "sha256": "1d9614638d18024d0fbb36575a15f1302a3adf044"
+                  "df10345688ec4f6e1c4ff32",
+        "name": "Qwen2.5-Coder-0.5B Instruct",
+        "params": "0.5B", "quant": "Q4_K_M",
+        "ram_gb": 1.2,
+        "blurb": "Fastest in the catalog. Best for low "
+                 "memory machines and quick completions.",
+    },
+    "1.5b": {
+        "file": "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf",
+        "url": "https://huggingface.co/Qwen/"
+               "Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/"
+               "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf",
+        "bytes": 1117320768,
+        "sha256": "cc324af070c2ecbfd324a30884d2f951a7ff756ab"
+                  "a85cb811a6ec436933bb046",
+        "name": "Qwen2.5-Coder-1.5B Instruct",
+        "params": "1.5B", "quant": "Q4_K_M",
+        "ram_gb": 2.2,
+        "blurb": "Fast and light. A good fit for small "
+                 "laptops and short sessions.",
+    },
+    "3b": {
+        "file": "qwen2.5-coder-3b-instruct-q4_k_m.gguf",
+        "url": "https://huggingface.co/Qwen/"
+               "Qwen2.5-Coder-3B-Instruct-GGUF/resolve/main/"
+               "qwen2.5-coder-3b-instruct-q4_k_m.gguf",
+        "bytes": 2104932800,
+        "sha256": "724fb256bec1ff062b2f65e4569e871ad2e95ab2a3"
+                  "989723d1769c54294730b7",
+        "name": "Qwen2.5-Coder-3B Instruct",
+        "params": "3B", "quant": "Q4_K_M",
+        "ram_gb": 3.6,
+        "blurb": "Balanced. Noticeably stronger code than "
+                 "the small models, still light to run.",
+    },
     "7b": {
         "file": "qwen2.5-coder-7b-instruct-q4_k_m.gguf",
         "url": "https://huggingface.co/Qwen/"
@@ -743,6 +798,11 @@ MODEL_CATALOG = {
         "bytes": 4683073536,
         "sha256": "509287f78cb4d4cf6b3843734733b914b2c158e43"
                   "e22a7f4bf5e963800894d3c",
+        "name": "Qwen2.5-Coder-7B Instruct",
+        "params": "7B", "quant": "Q4_K_M",
+        "ram_gb": 6.5,
+        "blurb": "Best quality in the catalog. The model "
+                 "this IDE is tuned around.",
     },
 }
 MODELS_DIR = Path(os.environ.get(
@@ -877,6 +937,28 @@ MODEL_NAME = "qwen2.5-coder-7b"
 
 DL_STATE = {"state": "idle", "done": 0, "total": 0,
             "error": "", "id": ""}
+
+# Desktop Cycle 3, D6: download controls for the model
+# store. Pause is honest about what it is: the worker
+# stops the transfer at the next chunk and KEEPS the
+# .part file, so a later Download resumes from it via the
+# Range header (the worker already supported resume; D6
+# just gives it a stop button). Cancel stops the
+# transfer and deletes the .part file. One control dict
+# per download worker (chat models, embedding model, URL
+# imports); a worker clears both flags when it starts.
+DL_CONTROL = {"pause": False, "cancel": False}
+EMBED_DL_CONTROL = {"pause": False, "cancel": False}
+IMPORT_DL_CONTROL = {"pause": False, "cancel": False}
+
+
+class _DlStop(Exception):
+    """Raised inside a download worker's read loop when
+    the store asks it to pause or cancel."""
+
+    def __init__(self, kind):
+        super().__init__(kind)
+        self.kind = kind
 
 
 def py_cmd():
@@ -1871,6 +1953,8 @@ def _embed_dl_worker():
     Settings / Find panel download action, never silently."""
     import hashlib
     entry = EMBED_MODEL
+    EMBED_DL_CONTROL.update({"pause": False,
+                             "cancel": False})
     try:
         MODELS_DIR.mkdir(parents=True, exist_ok=True)
         dest = MODELS_DIR / entry["file"]
@@ -1892,6 +1976,12 @@ def _embed_dl_worker():
             with open(part, "ab" if have else "wb") as f:
                 done = have
                 while True:
+                    # D6: pause/cancel, same contract as
+                    # the chat model worker.
+                    if EMBED_DL_CONTROL["cancel"]:
+                        raise _DlStop("cancel")
+                    if EMBED_DL_CONTROL["pause"]:
+                        raise _DlStop("pause")
                     chunk = r.read(1 << 20)
                     if not chunk:
                         break
@@ -1904,6 +1994,8 @@ def _embed_dl_worker():
                 "error": "download incomplete - tap Download "
                          "again to resume"})
             return
+        if EMBED_DL_CONTROL["cancel"]:
+            raise _DlStop("cancel")
         EMBED_DL_STATE["state"] = "verifying"
         h = hashlib.sha256()
         with open(part, "rb") as f:
@@ -1919,6 +2011,15 @@ def _embed_dl_worker():
         part.rename(dest)
         EMBED_DL_STATE.update({"state": "done",
                                "done": entry["bytes"]})
+    except _DlStop as stop:
+        # D6: pause keeps the partial file; cancel
+        # removes it.
+        if stop.kind == "cancel":
+            part.unlink(missing_ok=True)
+            EMBED_DL_STATE.update({"state": "idle",
+                                   "done": 0, "error": ""})
+        else:
+            EMBED_DL_STATE.update({"state": "paused"})
     except Exception as e:
         EMBED_DL_STATE.update({"state": "error",
                                "error": str(e)})
@@ -2201,6 +2302,672 @@ def embed_search(query, limit=10):
         r["score"] = round(r["score"], 4)
     return {"results": results, "engine": "neural",
             "available": True}
+
+
+# ---------------- Model store (Desktop Cycle 3, D6) ----
+# The store is a UX layer over the model system that was
+# already here: the pinned catalog and its verified
+# download worker (_dl_worker), the embedding model's
+# worker (_embed_dl_worker) and the path switcher. D6
+# adds: one listing that joins catalog + embedding +
+# imported models with machine-fit guidance, pause/cancel
+# controls on the existing workers, delete with an
+# active-model guard, and a custom GGUF import (local
+# file or URL) whose registry lives in app data
+# (DATA_DIR/imported-models.json, portable-aware), never
+# in the catalog constants. Imported models are labelled
+# "Imported by you": GhostIDE checks the GGUF header and
+# records the file's SHA-256 at import, and claims
+# nothing about where the file came from.
+GGUF_MAGIC = b"GGUF"
+EMBED_RAM_GB = 0.6
+IMPORTED_MODELS_FILE = DATA_DIR / "imported-models.json"
+IMPORT_DL_STATE = {"state": "idle", "done": 0, "total": 0,
+                   "error": "", "name": "", "part": "",
+                   "origin": ""}
+
+
+def _machine_ram_bytes():
+    """Total physical RAM in bytes, or None when it
+    cannot be read on this platform. None means the
+    store shows no fit guidance; the number is never
+    guessed."""
+    try:
+        if sys.platform.startswith("linux"):
+            with open("/proc/meminfo",
+                      encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        return int(line.split()[1]) * 1024
+        elif sys.platform == "darwin":
+            out = subprocess.run(
+                ["sysctl", "-n", "hw.memsize"],
+                capture_output=True, text=True, timeout=5)
+            if out.returncode == 0:
+                return int(out.stdout.strip())
+        elif os.name == "nt":
+            import ctypes
+
+            class _MemStatus(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual",
+                     ctypes.c_ulonglong)]
+            m = _MemStatus()
+            m.dwLength = ctypes.sizeof(_MemStatus)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(
+                    ctypes.byref(m)):
+                return int(m.ullTotalPhys)
+    except Exception:
+        pass
+    return None
+
+
+def _fit_class(ram_gb, total_bytes):
+    """Machine-fit guidance for one model: "fits" when
+    the estimated need is at most 60% of total RAM,
+    "tight" up to 90%, "too-big" beyond that, and
+    "unknown" when either number is missing. Guidance
+    only; nothing is ever blocked by it."""
+    if not ram_gb or not total_bytes:
+        return "unknown"
+    total_gb = total_bytes / float(1024 ** 3)
+    if ram_gb <= 0.6 * total_gb:
+        return "fits"
+    if ram_gb <= 0.9 * total_gb:
+        return "tight"
+    return "too-big"
+
+
+def _sha256_file(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 22), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _gguf_ok(path):
+    """True when the file starts with the GGUF header.
+    The only format check an import gets: it proves the
+    file claims to be a GGUF, nothing more."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(4) == GGUF_MAGIC
+    except Exception:
+        return False
+
+
+def _imported_models():
+    try:
+        data = json.loads(IMPORTED_MODELS_FILE.read_text(
+            encoding="utf-8"))
+        if isinstance(data, list):
+            return [e for e in data
+                    if isinstance(e, dict)
+                    and e.get("id") and e.get("file")]
+    except Exception:
+        pass
+    return []
+
+
+def _save_imported_models(entries):
+    IMPORTED_MODELS_FILE.parent.mkdir(parents=True,
+                                      exist_ok=True)
+    tmp = IMPORTED_MODELS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(entries, indent=1),
+                   encoding="utf-8")
+    os.replace(tmp, IMPORTED_MODELS_FILE)
+
+
+def _imported_by_id(mid):
+    for e in _imported_models():
+        if e["id"] == mid:
+            return e
+    return None
+
+
+def _import_id(name, digest):
+    slug = _re_mod.sub(r"[^a-z0-9]+", "-",
+                       (name or "model").lower()).strip("-")
+    return "imp-" + (slug[:24] or "model") + "-" + digest[:8]
+
+
+def _register_import(entry):
+    entries = [e for e in _imported_models()
+               if e["file"] != entry["file"]
+               and e["id"] != entry["id"]]
+    entries.append(entry)
+    _save_imported_models(entries)
+    return entry
+
+
+def _unique_model_dest(fname):
+    """A models-dir path for fname that does not clobber
+    a different existing file (a same-name file with the
+    same content is reused by the callers' hash check)."""
+    dest = MODELS_DIR / fname
+    if not dest.exists():
+        return dest
+    stem, suf = dest.stem, dest.suffix
+    n = 2
+    while dest.exists():
+        dest = MODELS_DIR / ("%s-%d%s" % (stem, n, suf))
+        n += 1
+    return dest
+
+
+def _dl_view(state):
+    total = state.get("total") or 0
+    done = state.get("done") or 0
+    return {"state": state.get("state", "idle"),
+            "done": done, "total": total,
+            "percent": (100.0 * done / total) if total
+            else 0.0,
+            "error": state.get("error", "")}
+
+
+def _model_loaded():
+    """True when a chat model is actually running: our
+    own llama-server process, or anything answering on
+    the model endpoint (for example a server the user
+    started themselves)."""
+    if _model_proc and _model_proc.poll() is None:
+        return True
+    return llama_health()
+
+
+def models_store():
+    """The store listing: catalog chat models, the
+    embedding model and imported models as cards, plus
+    machine RAM, disk usage and the active model. Card
+    data for catalog models comes straight from
+    MODEL_CATALOG / EMBED_MODEL, so the store can never
+    drift from the downloader's pins."""
+    total_ram = _machine_ram_bytes()
+    active_path = Path(MODEL)
+    rec_id = None
+    fits = [mid for mid, e in MODEL_CATALOG.items()
+            if _fit_class(e["ram_gb"], total_ram) == "fits"]
+    if fits:
+        rec_id = max(
+            fits,
+            key=lambda m: float(
+                MODEL_CATALOG[m]["params"][:-1]))
+    cards = []
+    for mid, e in MODEL_CATALOG.items():
+        dest = MODELS_DIR / e["file"]
+        exists = dest.is_file()
+        cards.append({
+            "id": mid, "kind": "catalog", "role": "chat",
+            "name": e["name"], "params": e["params"],
+            "quant": e["quant"], "file": e["file"],
+            "bytes": e["bytes"],
+            "installed": exists
+            and dest.stat().st_size == e["bytes"],
+            "installedBytes": dest.stat().st_size
+            if exists else None,
+            "ramGB": e["ram_gb"],
+            "fit": _fit_class(e["ram_gb"], total_ram),
+            "recommended": mid == rec_id,
+            "blurb": e["blurb"], "verified": True,
+            "active": active_path == dest,
+            "download": _dl_view(DL_STATE)
+            if DL_STATE.get("id") == mid else None})
+    epath = _embed_model_path()
+    cards.append({
+        "id": "embed", "kind": "catalog",
+        "role": "embedding",
+        "name": "nomic-embed-text-v1.5", "params": "",
+        "quant": "Q8_0", "file": EMBED_MODEL["file"],
+        "bytes": EMBED_MODEL["bytes"],
+        "installed": _embed_model_present(),
+        "installedBytes": epath.stat().st_size
+        if epath.is_file() else None,
+        "ramGB": EMBED_RAM_GB,
+        "fit": _fit_class(EMBED_RAM_GB, total_ram),
+        "recommended": False,
+        "blurb": "Embedding model. Powers Neural search "
+                 "in the Find panel and the agent's "
+                 "SEMANTIC action. After downloading, "
+                 "build the index from the Find panel's "
+                 "Neural mode.",
+        "verified": True, "active": False,
+        "download": _dl_view(EMBED_DL_STATE)})
+    for ent in _imported_models():
+        p = MODELS_DIR / ent["file"]
+        exists = p.is_file()
+        cards.append({
+            "id": ent["id"], "kind": "imported",
+            "role": "chat", "name": ent["name"],
+            "params": "", "quant": "",
+            "file": ent["file"], "bytes": ent["bytes"],
+            "installed": exists,
+            "installedBytes": p.stat().st_size
+            if exists else None,
+            "ramGB": None, "fit": "unknown",
+            "recommended": False,
+            "blurb": "Imported by you"
+            + (" from a web address. GhostIDE recorded "
+               "its SHA-256 at import; where it came "
+               "from is not verified by GhostIDE."
+               if ent.get("source") == "url"
+               else ". GhostIDE recorded its SHA-256 "
+                    "at import."),
+            "verified": False,
+            "sha256": ent.get("sha256", ""),
+            "source": ent.get("source", "file"),
+            "active": active_path == p,
+            "download": None})
+    models_bytes = 0
+    if MODELS_DIR.is_dir():
+        for f in MODELS_DIR.iterdir():
+            if f.is_file():
+                try:
+                    models_bytes += f.stat().st_size
+                except OSError:
+                    pass
+    free = None
+    try:
+        anchor = MODELS_DIR
+        while not anchor.exists() \
+                and anchor.parent != anchor:
+            anchor = anchor.parent
+        free = shutil.disk_usage(anchor).free
+    except Exception:
+        free = None
+    active_id = None
+    for c in cards:
+        if c["active"] and c["role"] == "chat":
+            active_id = c["id"]
+    imp = _dl_view(IMPORT_DL_STATE)
+    imp["name"] = IMPORT_DL_STATE.get("name", "")
+    imp["origin"] = IMPORT_DL_STATE.get("origin", "")
+    return {"ok": True,
+            "machine": {
+                "ramBytes": total_ram,
+                "ramGB": (total_ram / float(1024 ** 3))
+                if total_ram else None},
+            "disk": {"modelsDir": str(MODELS_DIR),
+                     "modelsBytes": models_bytes,
+                     "freeBytes": free},
+            "active": {"id": active_id, "name": MODEL_NAME,
+                       "path": MODEL},
+            "import": imp,
+            "models": cards}
+
+
+def _download_target(mid):
+    """Which download worker owns a store id, for the
+    pause/cancel controls."""
+    if mid in MODEL_CATALOG:
+        return {"state": DL_STATE, "control": DL_CONTROL,
+                "part": MODELS_DIR
+                / (MODEL_CATALOG[mid]["file"] + ".part")}
+    if mid == "embed":
+        return {"state": EMBED_DL_STATE,
+                "control": EMBED_DL_CONTROL,
+                "part": MODELS_DIR
+                / (EMBED_MODEL["file"] + ".part")}
+    if mid == "import":
+        return {"state": IMPORT_DL_STATE,
+                "control": IMPORT_DL_CONTROL,
+                "part": Path(IMPORT_DL_STATE["part"])
+                if IMPORT_DL_STATE.get("part") else None}
+    return None
+
+
+def _start_store_download(mid):
+    import threading
+    if mid in MODEL_CATALOG:
+        if DL_STATE["state"] in ("downloading",
+                                 "verifying"):
+            return {"error": "a model download is "
+                             "already running"}
+        threading.Thread(target=_dl_worker, args=(mid,),
+                         daemon=True).start()
+        return {"ok": True, "state": "downloading"}
+    if mid == "embed":
+        if _embed_model_present():
+            return {"ok": True, "downloaded": True}
+        if EMBED_DL_STATE["state"] in ("downloading",
+                                       "verifying"):
+            return {"ok": True, "state": "downloading"}
+        threading.Thread(target=_embed_dl_worker,
+                         daemon=True).start()
+        return {"ok": True, "state": "downloading"}
+    return {"error": "unknown model: " + str(mid)}
+
+
+def _pause_download(mid):
+    """Pause = stop the transfer at the next chunk and
+    keep the partial file; a later Download resumes it
+    through the Range header. With nothing downloading
+    this is an honest no-op that reports the state."""
+    t = _download_target(mid)
+    if t is None:
+        return {"error": "unknown model: " + str(mid)}
+    st = t["state"]
+    if st["state"] == "downloading":
+        t["control"]["pause"] = True
+        return {"ok": True, "download": _dl_view(st),
+                "note": "pausing: the partial file is "
+                        "kept and the next Download "
+                        "resumes it"}
+    return {"ok": True, "download": _dl_view(st),
+            "note": "nothing is downloading"}
+
+
+def _cancel_download(mid):
+    """Cancel = stop the transfer and delete the partial
+    file. A finished download that is being verified is
+    too late to cancel and says so."""
+    t = _download_target(mid)
+    if t is None:
+        return {"error": "unknown model: " + str(mid)}
+    st = t["state"]
+    if st["state"] == "downloading":
+        t["control"]["cancel"] = True
+        return {"ok": True, "download": _dl_view(st),
+                "note": "cancelling: the partial file "
+                        "will be deleted"}
+    if st["state"] == "verifying":
+        return {"error": "the download is complete and "
+                         "being verified; it is too late "
+                         "to cancel"}
+    if st["state"] == "paused":
+        if t["part"] is not None:
+            t["part"].unlink(missing_ok=True)
+        st.update({"state": "idle", "done": 0,
+                   "error": ""})
+        return {"ok": True, "download": _dl_view(st),
+                "note": "partial file deleted"}
+    return {"ok": True, "download": _dl_view(st),
+            "note": "nothing to cancel"}
+
+
+def _switch_to_path(p):
+    """Point the IDE at a model file (the /api/model/
+    switch behaviour, shared with the store's Set active
+    action): the running process we started is stopped;
+    Start model relaunches with the new file."""
+    global MODEL, MODEL_NAME
+    MODEL = str(p)
+    MODEL_NAME = p.name.replace(".gguf", "")
+    if _model_proc and _model_proc.poll() is None:
+        _model_proc.terminate()
+    return {"ok": True, "modelName": MODEL_NAME,
+            "modelPath": MODEL,
+            "bytes": p.stat().st_size}
+
+
+def _set_active_model(mid):
+    if mid == "embed":
+        return {"error": "the embedding model powers "
+                         "Neural search; it cannot be "
+                         "the chat model"}
+    if mid in MODEL_CATALOG:
+        e = MODEL_CATALOG[mid]
+        p = MODELS_DIR / e["file"]
+        if not (p.is_file()
+                and p.stat().st_size == e["bytes"]):
+            return {"error": "that model is not "
+                             "downloaded yet"}
+        return _switch_to_path(p)
+    ent = _imported_by_id(mid)
+    if ent is not None:
+        p = MODELS_DIR / ent["file"]
+        if not p.is_file():
+            return {"error": "the imported model file "
+                             "is missing"}
+        return _switch_to_path(p)
+    return {"error": "unknown model: " + str(mid)}
+
+
+def _delete_model(mid, stop=False):
+    """Delete an installed model's file (and its import
+    registry entry). Guards: a model whose download is
+    in flight must be cancelled first; the ACTIVE model
+    cannot be deleted while it is loaded unless the
+    caller asked to stop it first, and a model server
+    started outside GhostIDE cannot be stopped by us."""
+    global MODEL, MODEL_NAME
+    if mid == "embed":
+        if EMBED_DL_STATE["state"] in (
+                "downloading", "verifying", "paused"):
+            return {"error": "a download of this model "
+                             "is in progress; cancel it "
+                             "first"}
+        if EMBED_BUILD_STATE.get("state") == "building":
+            return {"error": "the neural index is "
+                             "building; wait for it to "
+                             "finish, then delete"}
+        p = _embed_model_path()
+        if not p.is_file():
+            return {"error": "the embedding model is "
+                             "not downloaded"}
+        _embed_stop()
+        p.unlink()
+        (MODELS_DIR / (EMBED_MODEL["file"] + ".part")
+         ).unlink(missing_ok=True)
+        return {"ok": True, "deleted": EMBED_MODEL["file"]}
+    ent = None
+    if mid in MODEL_CATALOG:
+        if DL_STATE.get("id") == mid \
+                and DL_STATE["state"] in (
+                    "downloading", "verifying", "paused"):
+            return {"error": "a download of this model "
+                             "is in progress; cancel it "
+                             "first"}
+        p = MODELS_DIR / MODEL_CATALOG[mid]["file"]
+    else:
+        ent = _imported_by_id(mid)
+        if ent is None:
+            return {"error": "unknown model: " + str(mid)}
+        p = MODELS_DIR / ent["file"]
+    if not p.is_file():
+        return {"error": "that model is not installed"}
+    was_active = Path(MODEL) == p
+    if was_active and _model_loaded():
+        if not stop:
+            return {"error": "this model is loaded and "
+                             "running; stop it before "
+                             "deleting",
+                    "code": "model-loaded",
+                    "canStop": True}
+        if _model_proc and _model_proc.poll() is None:
+            _model_proc.terminate()
+            for _ in range(50):
+                if _model_proc.poll() is not None:
+                    break
+                time.sleep(0.1)
+        if _model_loaded():
+            return {"error": "the running model was "
+                             "started outside GhostIDE, "
+                             "so GhostIDE cannot stop it; "
+                             "stop it yourself, then "
+                             "delete"}
+    p.unlink()
+    Path(str(p) + ".part").unlink(missing_ok=True)
+    if ent is not None:
+        _save_imported_models(
+            [e for e in _imported_models()
+             if e["id"] != mid])
+    if was_active:
+        MODEL = _default_model()
+        MODEL_NAME = Path(MODEL).name.replace(
+            ".gguf", "")
+    return {"ok": True, "deleted": p.name}
+
+
+def _import_local(path_str, name=None):
+    """Import a GGUF from a file on this machine: header
+    check, copy into the models folder, SHA-256 recorded
+    in the import registry. No verification claim beyond
+    that."""
+    src = Path(path_str or "").expanduser()
+    if not src.is_file():
+        return {"error": "no such file: "
+                         + str(path_str)}
+    if not _gguf_ok(src):
+        return {"error": "that file is not a GGUF model "
+                         "(it does not start with the "
+                         "GGUF header)"}
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    fname = src.name
+    if not fname.lower().endswith(".gguf"):
+        fname += ".gguf"
+    dest = MODELS_DIR / fname
+    if dest.resolve() != src.resolve():
+        if dest.exists() \
+                and _sha256_file(dest) != _sha256_file(src):
+            dest = _unique_model_dest(fname)
+        if dest.resolve() != src.resolve():
+            shutil.copyfile(src, dest)
+    digest = _sha256_file(dest)
+    disp = (name or "").strip() \
+        or dest.name.replace(".gguf", "")
+    entry = _register_import({
+        "id": _import_id(disp, digest), "name": disp,
+        "file": dest.name,
+        "bytes": dest.stat().st_size, "sha256": digest,
+        "source": "file", "origin": str(src),
+        "imported_at": time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+    return {"ok": True, "model": entry}
+
+
+def _import_url_worker(url, fname, disp):
+    """Background URL import: the download workers'
+    discipline (a .part file, Range resume, pause and
+    cancel) minus the catalog pin, because an imported
+    file has no pin to check against. On completion the
+    GGUF header is checked and the SHA-256 is computed
+    and stored in the registry; the source is recorded
+    as not verified."""
+    IMPORT_DL_CONTROL.update({"pause": False,
+                              "cancel": False})
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    part = MODELS_DIR / (fname + ".part")
+    IMPORT_DL_STATE.update({
+        "state": "downloading", "done": 0, "total": 0,
+        "error": "", "name": disp, "part": str(part),
+        "origin": url})
+    try:
+        have = part.stat().st_size if part.exists() else 0
+        req = urllib.request.Request(
+            url, headers={"User-Agent":
+                          "GhostIDE model import"})
+        if have:
+            req.add_header("Range", "bytes=%d-" % have)
+        with urllib.request.urlopen(req, timeout=60) as r:
+            if have and r.status != 206:
+                have = 0
+            total = have
+            try:
+                total += int(
+                    r.headers.get("Content-Length") or 0)
+            except Exception:
+                total = have
+            IMPORT_DL_STATE["total"] = total
+            IMPORT_DL_STATE["done"] = have
+            with open(part, "ab" if have else "wb") as f:
+                done = have
+                while True:
+                    if IMPORT_DL_CONTROL["cancel"]:
+                        raise _DlStop("cancel")
+                    if IMPORT_DL_CONTROL["pause"]:
+                        raise _DlStop("pause")
+                    chunk = r.read(1 << 20)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    done += len(chunk)
+                    IMPORT_DL_STATE["done"] = done
+        if not _gguf_ok(part):
+            part.unlink(missing_ok=True)
+            IMPORT_DL_STATE.update({
+                "state": "error",
+                "error": "the downloaded file is not a "
+                         "GGUF model (it does not start "
+                         "with the GGUF header); nothing "
+                         "was imported"})
+            return
+        dest = MODELS_DIR / fname
+        if dest.exists() \
+                and _sha256_file(dest) != _sha256_file(part):
+            dest = _unique_model_dest(fname)
+        os.replace(part, dest)
+        digest = _sha256_file(dest)
+        _register_import({
+            "id": _import_id(disp, digest), "name": disp,
+            "file": dest.name,
+            "bytes": dest.stat().st_size,
+            "sha256": digest, "source": "url",
+            "origin": url,
+            "imported_at": time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+        IMPORT_DL_STATE.update({
+            "state": "done",
+            "done": dest.stat().st_size,
+            "total": dest.stat().st_size})
+    except _DlStop as stop:
+        if stop.kind == "cancel":
+            part.unlink(missing_ok=True)
+            IMPORT_DL_STATE.update({"state": "idle",
+                                    "done": 0, "error": ""})
+        else:
+            IMPORT_DL_STATE.update({"state": "paused"})
+    except Exception as e:
+        IMPORT_DL_STATE.update({"state": "error",
+                                "error": str(e)})
+
+
+def _start_url_import(url, name=None):
+    import threading
+    url = (url or "").strip()
+    if not (url.startswith("https://")
+            or url.startswith("http://")):
+        return {"error": "the address must start with "
+                         "http:// or https://"}
+    if IMPORT_DL_STATE["state"] in ("downloading",
+                                     "verifying"):
+        return {"error": "an import is already running"}
+    base = urllib.parse.urlparse(url).path.rsplit(
+        "/", 1)[-1]
+    if not base.lower().endswith(".gguf"):
+        base = "imported-model.gguf"
+    disp = (name or "").strip() \
+        or base.replace(".gguf", "")
+    threading.Thread(target=_import_url_worker,
+                     args=(url, base, disp),
+                     daemon=True).start()
+    return {"ok": True, "state": "downloading",
+            "name": disp}
+
+
+def _models_host_only(handler):
+    """D6: model import and delete act on the host's
+    files (import reads any path the host user can read;
+    delete removes files from the host's model library),
+    so - exactly like the D8 MCP settings guard - pair
+    guests may not use them. Returns True when the
+    caller may proceed."""
+    if handler.client_address[0] in ("127.0.0.1", "::1"):
+        return True
+    handler.send_json(
+        {"error": "model import and delete happen on "
+                  "the host"},
+        status=403)
+    return False
 
 
 # ---- Roadmap G28: offline reference docs ----
@@ -3332,6 +4099,7 @@ def _dl_worker(mid):
     global MODEL, MODEL_NAME
     import hashlib
     entry = MODEL_CATALOG[mid]
+    DL_CONTROL.update({"pause": False, "cancel": False})
     try:
         MODELS_DIR.mkdir(parents=True, exist_ok=True)
         dest = MODELS_DIR / entry["file"]
@@ -3352,6 +4120,13 @@ def _dl_worker(mid):
             with open(part, "ab" if have else "wb") as f:
                 done = have
                 while True:
+                    # D6: pause keeps the .part file (a
+                    # later Download resumes it); cancel
+                    # removes it. Checked per chunk.
+                    if DL_CONTROL["cancel"]:
+                        raise _DlStop("cancel")
+                    if DL_CONTROL["pause"]:
+                        raise _DlStop("pause")
                     chunk = r.read(1 << 20)
                     if not chunk:
                         break
@@ -3364,6 +4139,8 @@ def _dl_worker(mid):
                 "error": "download incomplete - tap Download "
                          "again to resume"})
             return
+        if DL_CONTROL["cancel"]:
+            raise _DlStop("cancel")
         DL_STATE["state"] = "verifying"
         h = hashlib.sha256()
         with open(part, "rb") as f:
@@ -3380,6 +4157,15 @@ def _dl_worker(mid):
         DL_STATE.update({"state": "done", "done": entry["bytes"]})
         MODEL = str(dest)
         MODEL_NAME = dest.name.replace(".gguf", "")
+    except _DlStop as stop:
+        # D6: pause keeps the partial file for a Range
+        # resume; cancel removes it.
+        if stop.kind == "cancel":
+            part.unlink(missing_ok=True)
+            DL_STATE.update({"state": "idle", "done": 0,
+                             "error": ""})
+        else:
+            DL_STATE.update({"state": "paused"})
     except Exception as e:
         DL_STATE.update({"state": "error", "error": str(e)})
 
@@ -6744,6 +7530,13 @@ class Handler(SimpleHTTPRequestHandler):
                     "modelName": MODEL_NAME, "modelPath": MODEL,
                     "exists": mp.is_file(),
                     "bytes": mp.stat().st_size if mp.is_file() else 0})
+            if parsed.path == "/api/models/store":
+                # Desktop Cycle 3, D6: the model store
+                # listing (catalog + embedding + imported
+                # cards, machine fit, disk, download
+                # states). Read-only; spawns nothing, so
+                # it stays open like the other model GETs.
+                return self.send_json(models_store())
             if parsed.path == "/api/git/status":
                 rc, out, err, _ = git_out(
                     ["status", "--porcelain=v1", "--branch"])
@@ -7149,6 +7942,56 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json(
                     {**EMBED_DL_STATE,
                      "state": "downloading"})
+            if parsed.path == "/api/models/download":
+                # D6: the store's download (and resume)
+                # action for any catalog chat model or
+                # the embedding model, on the existing
+                # verified workers.
+                data = self.read_json()
+                return self.send_json(
+                    _start_store_download(
+                        str(data.get("id", ""))))
+            if parsed.path == "/api/models/pause":
+                data = self.read_json()
+                return self.send_json(
+                    _pause_download(
+                        str(data.get("id", ""))))
+            if parsed.path == "/api/models/cancel":
+                data = self.read_json()
+                return self.send_json(
+                    _cancel_download(
+                        str(data.get("id", ""))))
+            if parsed.path == "/api/models/delete":
+                # D6: host-only (removes files from the
+                # host's model library).
+                if not _models_host_only(self):
+                    return
+                data = self.read_json()
+                return self.send_json(
+                    _delete_model(
+                        str(data.get("id", "")),
+                        stop=bool(data.get("stop"))))
+            if parsed.path == "/api/models/import":
+                # D6: host-only (reads a file path on
+                # the host, or fetches a URL into the
+                # host's model library).
+                if not _models_host_only(self):
+                    return
+                data = self.read_json()
+                if data.get("url"):
+                    return self.send_json(
+                        _start_url_import(
+                            str(data.get("url")),
+                            data.get("name")))
+                return self.send_json(
+                    _import_local(
+                        str(data.get("path", "")),
+                        data.get("name")))
+            if parsed.path == "/api/models/active":
+                data = self.read_json()
+                return self.send_json(
+                    _set_active_model(
+                        str(data.get("id", ""))))
             if parsed.path == "/api/model/start":
                 return self.send_json(start_model())
             if parsed.path == "/api/agent-runs":

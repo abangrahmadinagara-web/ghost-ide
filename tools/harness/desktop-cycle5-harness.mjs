@@ -26,14 +26,14 @@ let passed = 0, failed = 0;
 const ck = (n, c) => { console.log((c ? "PASS " : "FAIL ") + n); c ? passed++ : failed++; };
 
 /* ---------- static pins ---------- */
-ck("D5 version: desktop train at 3.15.0, phone train untouched",
-   vjson.desktop && vjson.desktop.version === "3.15.0" &&
-   py.includes('APP_VERSION = "3.15.0"') &&
-   vjson.version === "3.15.0" &&
+ck("D5 version: desktop train agreement (3.15.0 at D5), phone train untouched",
+   vjson.desktop && vjson.desktop.version !== "3.10.1" &&
+   py.includes('APP_VERSION = "' + vjson.desktop.version + '"') &&
+   vjson.version === vjson.desktop.version &&
    vjson.latest === "3.10.1" &&
    vjson.android && vjson.android.version === "3.10.1");
-ck("D5 route census re-derived: 183 (178 + 5 embed routes)",
-   (py.match(/parsed\.path ==/g) || []).length === 183);
+ck("D5 route census re-derived: 190 (183 + 7 model store routes in D6)",
+   (py.match(/parsed\.path ==/g) || []).length === 190);
 ck("D5 server: model pin is the real nomic asset (size + sha256)",
    py.includes('"nomic-embed-text-v1.5.Q8_0.gguf"') &&
    py.includes('"bytes": 146146432') &&
@@ -139,8 +139,8 @@ try {
   }
   if (!up) throw new Error("server did not come up:\n" + serverLog);
   const health = await call("GET", "/api/health");
-  ck("E2E server reports 3.15.0",
-     health.data.version === "3.15.0");
+  ck("E2E server reports the desktop train version",
+     health.data.version === vjson.desktop.version);
 
   const st0 = await call("GET", "/api/embed/status");
   ck("E2E status: model present, index empty, unavailable",

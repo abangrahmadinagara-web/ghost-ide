@@ -34627,6 +34627,323 @@
     }
     alert("Neural index build started. Progress shows in the Find panel's Neural mode and in Settings.");
   };
+  var modelsStoreTimer = null;
+  function fmtGB(bytes) {
+    if (bytes === null || bytes === void 0) return "?";
+    if (bytes >= 1e9) return (bytes / 1e9).toFixed(1) + " GB";
+    if (bytes >= 1e6) return Math.round(bytes / 1e6) + " MB";
+    return Math.max(1, Math.round(bytes / 1e3)) + " KB";
+  }
+  function fitText(fit) {
+    if (fit === "fits") return "Fits this machine";
+    if (fit === "tight") return "Tight on this machine";
+    if (fit === "too-big") return "Too big for this machine";
+    return "Fit on this machine is unknown";
+  }
+  function msNote(box, text) {
+    const d = document.createElement("div");
+    d.className = "dim";
+    d.textContent = text;
+    box.appendChild(d);
+    return d;
+  }
+  function msBtn(label, fn) {
+    const b = document.createElement("button");
+    b.className = "ghostbtn";
+    b.textContent = label;
+    b.onclick = fn;
+    return b;
+  }
+  function msBar(box, percent2) {
+    const bar = document.createElement("div");
+    bar.className = "modelbar";
+    const fill = document.createElement("div");
+    fill.className = "modelbarfill";
+    fill.style.width = Math.max(0, Math.min(100, percent2)) + "%";
+    bar.appendChild(fill);
+    box.appendChild(bar);
+  }
+  async function msPost(path, body) {
+    try {
+      return await postJson(path, body || {});
+    } catch (e) {
+      return { error: "could not reach the server" };
+    }
+  }
+  async function openModelsPanel() {
+    hideTools();
+    $("settingsPanel").classList.add("hidden");
+    $("todoTitle").textContent = "Model store";
+    $("todoResults").textContent = "Loading the model store\u2026";
+    $("todoPanel").classList.remove("hidden");
+    await renderModelsStore();
+  }
+  var toolModelsBtn = $("toolModels");
+  if (toolModelsBtn)
+    toolModelsBtn.onclick = () => {
+      openModelsPanel();
+    };
+  $("modelStoreBtn").onclick = () => {
+    openModelsPanel();
+  };
+  function modelStoreCard(box, m) {
+    const card = document.createElement("div");
+    card.className = "modelcard";
+    const title = document.createElement("div");
+    title.className = "mc-title";
+    title.appendChild(document.createTextNode(m.name));
+    const badges = [];
+    if (m.recommended) badges.push("Recommended for this machine");
+    if (m.active) badges.push("Active chat model");
+    if (m.kind === "imported") badges.push("Imported by you");
+    for (const t2 of badges) {
+      const s = document.createElement("span");
+      s.className = "mc-badge";
+      s.textContent = t2;
+      title.appendChild(s);
+    }
+    card.appendChild(title);
+    const bits = [];
+    if (m.role === "embedding") bits.push("Embedding model");
+    if (m.params) bits.push(m.params);
+    if (m.quant) bits.push(m.quant);
+    bits.push(fmtGB(m.bytes) + " download");
+    if (m.ramGB)
+      bits.push("about " + m.ramGB + " GB of RAM to run (estimate)");
+    msNote(card, bits.join(" \xB7 "));
+    if (m.blurb) msNote(card, m.blurb);
+    if (m.role === "chat" || m.role === "embedding")
+      msNote(card, fitText(m.fit) + ".");
+    const actions = document.createElement("div");
+    actions.className = "mc-actions";
+    card.appendChild(actions);
+    const dl = m.download;
+    const rerender = () => {
+      renderModelsStore();
+    };
+    if (dl && dl.state === "downloading") {
+      msBar(card, dl.percent);
+      msNote(card, "Downloading\u2026 " + Math.round(dl.percent) + "% \xB7 " + fmtGB(dl.done) + " of " + fmtGB(dl.total));
+      actions.appendChild(msBtn("Pause", async () => {
+        await msPost("/api/models/pause", { id: m.id });
+        rerender();
+      }));
+      actions.appendChild(msBtn("Cancel", async () => {
+        await msPost("/api/models/cancel", { id: m.id });
+        rerender();
+      }));
+    } else if (dl && dl.state === "paused") {
+      msBar(card, dl.percent);
+      msNote(card, "Paused at " + Math.round(dl.percent) + "%. The partial file is kept; Download resumes where it left off.");
+      actions.appendChild(msBtn("Resume download", async () => {
+        await msPost("/api/models/download", { id: m.id });
+        rerender();
+      }));
+      actions.appendChild(msBtn("Cancel", async () => {
+        await msPost("/api/models/cancel", { id: m.id });
+        rerender();
+      }));
+    } else if (dl && dl.state === "verifying") {
+      msNote(card, "Verifying the download checksum\u2026");
+    } else if (dl && dl.state === "error") {
+      msNote(card, "Download error: " + (dl.error || "unknown"));
+      actions.appendChild(msBtn("Download again", async () => {
+        await msPost("/api/models/download", { id: m.id });
+        rerender();
+      }));
+    }
+    if (m.installed) {
+      if (m.role === "chat" && !m.active)
+        actions.appendChild(msBtn("Use as chat model", async () => {
+          const d = await msPost(
+            "/api/models/active",
+            { id: m.id }
+          );
+          if (d.error) {
+            alert(d.error);
+            return;
+          }
+          pollHealth();
+          rerender();
+        }));
+      if (m.role === "embedding")
+        actions.appendChild(msBtn("Build neural index", async () => {
+          const d = await msPost("/api/embed/build", {});
+          if (d.error) {
+            alert(d.error);
+            return;
+          }
+          alert("Neural index build started. Progress shows in the Find panel's Neural mode.");
+        }));
+      actions.appendChild(msBtn("Delete", async () => {
+        let d = await msPost(
+          "/api/models/delete",
+          { id: m.id }
+        );
+        if (d && d.code === "model-loaded") {
+          if (!confirm("This model is loaded and running. Stop it and delete the file?"))
+            return;
+          d = await msPost(
+            "/api/models/delete",
+            { id: m.id, stop: true }
+          );
+        }
+        if (d && d.error) {
+          alert(d.error);
+          return;
+        }
+        pollHealth();
+        rerender();
+      }));
+    } else if (!dl || dl.state !== "downloading" && dl.state !== "paused" && dl.state !== "verifying") {
+      actions.appendChild(msBtn("Download", async () => {
+        const d = await msPost(
+          "/api/models/download",
+          { id: m.id }
+        );
+        if (d && d.error) {
+          alert(d.error);
+          return;
+        }
+        rerender();
+      }));
+    }
+    box.appendChild(card);
+  }
+  async function renderModelsStore() {
+    const box = $("todoResults");
+    if (!box || $("todoTitle").textContent !== "Model store")
+      return;
+    let d;
+    try {
+      d = await (await fetch("/api/models/store")).json();
+    } catch (e) {
+      box.textContent = "Could not reach the server.";
+      return;
+    }
+    if (d.error) {
+      box.textContent = d.error;
+      return;
+    }
+    const typed = {};
+    for (const el of box.querySelectorAll("input[data-ms]"))
+      typed[el.getAttribute("data-ms")] = el.value;
+    box.textContent = "";
+    const ram = d.machine && d.machine.ramGB;
+    msNote(box, ram ? "This machine has about " + ram.toFixed(1) + " GB of RAM. Fit marks are guidance from the estimates on each card; nothing is blocked by them." : "This machine's RAM could not be read, so no fit guidance is shown.");
+    if (d.disk)
+      msNote(box, "Models on disk: " + fmtGB(d.disk.modelsBytes) + (d.disk.freeBytes !== null && d.disk.freeBytes !== void 0 ? " \xB7 free space where models live: " + fmtGB(d.disk.freeBytes) : "") + " \xB7 folder: " + d.disk.modelsDir);
+    for (const m of d.models || [])
+      modelStoreCard(box, m);
+    const ih = document.createElement("h4");
+    ih.textContent = "Add your own GGUF";
+    box.appendChild(ih);
+    msNote(box, "Import a GGUF file from this machine or from a web address. GhostIDE checks the file starts with the GGUF header and records its SHA-256. Imported models are labelled Imported by you; where a file came from is not verified by GhostIDE.");
+    const nameIn = document.createElement("input");
+    nameIn.type = "text";
+    nameIn.placeholder = "display name (optional)";
+    nameIn.setAttribute("data-ms", "name");
+    nameIn.value = typed.name || "";
+    box.appendChild(nameIn);
+    const pathIn = document.createElement("input");
+    pathIn.type = "text";
+    pathIn.placeholder = "/path/to/model.gguf";
+    pathIn.setAttribute("data-ms", "path");
+    pathIn.value = typed.path || "";
+    box.appendChild(pathIn);
+    const prow = document.createElement("div");
+    prow.className = "mc-actions";
+    prow.appendChild(msBtn("Import file", async () => {
+      const dd = await msPost(
+        "/api/models/import",
+        {
+          path: pathIn.value.trim(),
+          name: nameIn.value.trim()
+        }
+      );
+      if (dd.error) {
+        alert(dd.error);
+        return;
+      }
+      renderModelsStore();
+    }));
+    box.appendChild(prow);
+    const urlIn = document.createElement("input");
+    urlIn.type = "text";
+    urlIn.placeholder = "https://example.com/model.gguf";
+    urlIn.setAttribute("data-ms", "url");
+    urlIn.value = typed.url || "";
+    box.appendChild(urlIn);
+    const urow = document.createElement("div");
+    urow.className = "mc-actions";
+    urow.appendChild(msBtn("Import from address", async () => {
+      const dd = await msPost(
+        "/api/models/import",
+        {
+          url: urlIn.value.trim(),
+          name: nameIn.value.trim()
+        }
+      );
+      if (dd.error) {
+        alert(dd.error);
+        return;
+      }
+      renderModelsStore();
+    }));
+    box.appendChild(urow);
+    const imp = d.import || {};
+    if (imp.state === "downloading") {
+      msBar(box, imp.percent);
+      msNote(box, "Importing " + (imp.name || "model") + "\u2026 " + Math.round(imp.percent) + "% \xB7 " + fmtGB(imp.done) + (imp.total ? " of " + fmtGB(imp.total) : ""));
+      const crow = document.createElement("div");
+      crow.className = "mc-actions";
+      crow.appendChild(msBtn("Cancel import", async () => {
+        await msPost("/api/models/cancel", { id: "import" });
+        renderModelsStore();
+      }));
+      box.appendChild(crow);
+    } else if (imp.state === "paused") {
+      msNote(box, "Import paused at " + Math.round(imp.percent) + "%. The partial file is kept.");
+      const rrow = document.createElement("div");
+      rrow.className = "mc-actions";
+      rrow.appendChild(msBtn("Resume import", async () => {
+        const dd = await msPost(
+          "/api/models/import",
+          { url: imp.origin, name: imp.name }
+        );
+        if (dd.error) {
+          alert(dd.error);
+          return;
+        }
+        renderModelsStore();
+      }));
+      rrow.appendChild(msBtn("Cancel import", async () => {
+        await msPost("/api/models/cancel", { id: "import" });
+        renderModelsStore();
+      }));
+      box.appendChild(rrow);
+    } else if (imp.state === "error") {
+      msNote(box, "Import error: " + (imp.error || "unknown"));
+    }
+    let active = imp.state === "downloading" || imp.state === "verifying";
+    for (const m of d.models || [])
+      if (m.download && (m.download.state === "downloading" || m.download.state === "verifying"))
+        active = true;
+    if (active) {
+      if (!modelsStoreTimer)
+        modelsStoreTimer = setInterval(() => {
+          if ($("todoPanel").classList.contains("hidden") || $("todoTitle").textContent !== "Model store") {
+            clearInterval(modelsStoreTimer);
+            modelsStoreTimer = null;
+            return;
+          }
+          renderModelsStore();
+        }, 2e3);
+    } else if (modelsStoreTimer) {
+      clearInterval(modelsStoreTimer);
+      modelsStoreTimer = null;
+    }
+  }
   function shortModelLabel(modelName) {
     const name2 = String(modelName || "");
     const m = name2.match(/(\d+(?:\.\d+)?)\s*B\b/i);
