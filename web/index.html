@@ -55,6 +55,7 @@ setTimeout(function () {
     <button id="dupFileBtn" title="Duplicate the open file">⧉ Dup</button>
     <span id="modelPill" class="pill down">model: checking…</span>
     <span id="updatePill" class="pill hidden" title="An update is available">⬆ update</span>
+    <span id="trustPill" class="pill hidden" title="This workspace is not trusted: agent actions, terminal and MCP tools are off">🔒 untrusted</span>
     <span id="pairChip" class="pill hidden" title="Pair mode">👥</span>
     <span id="healthDot" class="pill" title="Server health: checking…">●</span>
     <button id="startModelBtn" class="hidden">Start model</button>
@@ -398,6 +399,14 @@ setTimeout(function () {
   </div>
 </div>
 <button id="tourChip" class="hidden">🎓 New here? Take the 3-minute tour</button>
+<div id="trustBanner" class="hidden" role="dialog" aria-label="Workspace trust">
+  <div class="panel-head"><h3>🔒 Trust this workspace?</h3></div>
+  <p id="trustBannerBody">While a workspace is not trusted, the agent, the terminal and MCP tools stay off. Editing and reading files still work. Trust is remembered for this folder.</p>
+  <div class="row" style="display:flex;gap:8px">
+    <button id="trustNowBtn">Trust this workspace</button>
+    <button id="trustLaterBtn">Not now</button>
+  </div>
+</div>
 <div id="wsMenu" class="hidden"></div>
 <div id="findPanel" class="hidden">
   <h3 id="findTitle">Find in project</h3>
@@ -991,6 +1000,14 @@ setTimeout(function () {
     <button id="setCopySettings">Copy settings</button>
     <button id="setClearHist">Clear on-device histories</button>
     <span id="setUpdateOut"></span></p>
+  <p class="dim" id="setUpdFlowRow">Desktop updates: <span id="setUpdFlowOut">…</span>
+    <button id="setUpdDownloadBtn">Download update</button>
+    <button id="setUpdApplyBtn">Restart to apply</button>
+    <button id="setUpdRollbackBtn">Roll back to previous</button>
+    <label><input type="checkbox" id="setUpdAutoChk"> Check on launch</label></p>
+  <p class="dim">Workspace trust: <span id="setTrustInfo">…</span>
+    <button id="setTrustBtn">Trust this workspace</button></p>
+  <p class="dim">Workspace instructions: <span id="setInstrInfo">…</span></p>
   <p class="dim">Ecosystem bundle: <span id="setEcoInfo">…</span></p>
   <p class="dim">MCP sessions: <span id="setMcpInfo">…</span> <button id="setMcpRestart" title="Drop every persistent MCP session (desktop) and clear the phone's list cache">Restart sessions</button></p>
   <p class="dim">Paired devices: <span id="setPairInfo">…</span></p>

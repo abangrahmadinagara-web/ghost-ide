@@ -1,6 +1,1 @@
-{
- "notes": "Desktop packaging (G18): installable builds, in-app 7B model download, update check.",
- "url": "https://github.com/littlestjames82-sys/ghost-ide/releases",
- "version": "1.28.0",
- "latest": "3.10.1"
-}
+{"android":{"version":"3.10.1"},"desktop":{"manifest":"https://downloads.ghostdeveloperstudio.com/latest.json","version":"3.11.0"},"latest":"3.10.1","notes":"Desktop 3.11.0 (Desktop Cycle 1): portable mode, packaged-app updates with rollback, AGENTS.md workspace instructions and workspace trust. Android stays 3.10.1; its next release re-syncs the shared version train.","url":"https://github.com/littlestjames82-sys/ghost-ide/releases","version":"3.11.0"}

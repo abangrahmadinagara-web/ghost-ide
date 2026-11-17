@@ -112,8 +112,28 @@ served ungated by design.
   (`PRIVACY.md` explains the data story, which is
   short: nothing is collected).
 - **Updates**: Settings can check for updates against
-  `VERSION.json` in this repo. It only ever reports; it
-  never downloads or installs by itself.
+  `VERSION.json` in this repo (report-only). The
+  packaged desktop app goes one step further, with the
+  user's say-so at every step: it checks `latest.json`
+  on the downloads site, downloads and SHA-256-verifies
+  the package, stages it, and swaps it in on the next
+  restart, keeping the previous version for one-click
+  rollback. Nothing is ever installed silently, and
+  source runs stay report-only.
+- **Portable mode** (desktop): run with `--portable`
+  (or `GHOSTIDE_PORTABLE=1`) and everything the app
+  keeps - seeded workspace, models, the llama.cpp
+  runtime, settings/state, trust decisions - lives in
+  a `ghostide-data/` folder beside the executable (or
+  beside `server.py` in a source run).
+- **Workspace trust + AGENTS.md** (desktop): a folder
+  opened in the IDE starts untrusted until you trust
+  it; while untrusted, agent actions, terminal
+  execution and MCP tools are refused by the server
+  itself. An `AGENTS.md` at the workspace root (or a
+  `.ghostide/AGENTS.md` override) is folded into the
+  agent's system context, and Settings shows which
+  instruction files are loaded.
 
 ## How it is proven
 
@@ -143,6 +163,11 @@ what — see `docs/TESTING.md` in the Android repo.
 ## Layout
 
 - `server.py` — the desktop backend (Python stdlib only)
+- `ghost_paths.py`, `updater.py`, `workspace_trust.py` —
+  app-data paths + portable mode, the packaged-app
+  updater, and workspace trust + AGENTS.md (Desktop
+  Cycle 1); `tests/` holds their unit and integration
+  tests (`python3 -m unittest discover -s tests`)
 - `debug_bridge.py` — the debugger bridge (bdb over stdio)
 - `web/` — the frontend (CodeMirror 6, built with esbuild)
 - `tools/` — the harness suite, probes, and bundle gates

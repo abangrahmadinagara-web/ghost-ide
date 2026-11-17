@@ -33921,6 +33921,8 @@
     $("settingsPanel").classList.toggle("hidden");
     refreshModelDl();
     refreshLlamaDl();
+    refreshTrustUI(false);
+    refreshUpdateFlow();
   };
   $("settingsClose").onclick = () => $("settingsPanel").classList.add("hidden");
   {
@@ -34002,6 +34004,143 @@
       out.textContent = "check failed (offline?)";
     }
   };
+  var trustState = null;
+  async function refreshTrustUI(promptIfNeeded) {
+    try {
+      const r = await fetch("/api/trust");
+      const d = await r.json();
+      if (!d || typeof d.trusted !== "boolean") {
+        trustState = null;
+        $("trustPill").classList.add("hidden");
+        $("trustBanner").classList.add("hidden");
+        return;
+      }
+      trustState = d;
+      const pill = $("trustPill");
+      const banner = $("trustBanner");
+      if (d.trusted) {
+        pill.classList.add("hidden");
+        banner.classList.add("hidden");
+      } else {
+        pill.classList.remove("hidden");
+        if (promptIfNeeded && d.decision === null)
+          banner.classList.remove("hidden");
+      }
+      const info = $("setTrustInfo");
+      if (info) info.textContent = d.trusted ? "trusted (agent, terminal and MCP tools are on)" : "not trusted: agent actions, terminal and MCP tools are off for this folder";
+      const tbtn = $("setTrustBtn");
+      if (tbtn) tbtn.classList.toggle("hidden", !!d.trusted);
+    } catch (e) {
+    }
+    refreshInstrUI();
+  }
+  async function refreshInstrUI() {
+    try {
+      const r = await fetch("/api/instructions");
+      const d = await r.json();
+      const info = $("setInstrInfo");
+      if (!info) return;
+      if (d && d.files && d.files.length)
+        info.textContent = d.files.map(
+          (f) => f.rel + " (" + f.chars + " chars, in the agent's system context)"
+        ).join(", ");
+      else
+        info.textContent = "none (no AGENTS.md in this workspace)";
+    } catch (e) {
+    }
+  }
+  async function setTrust(trusted) {
+    try {
+      await postJson("/api/trust", { trusted });
+    } catch (e) {
+    }
+    $("trustBanner").classList.add("hidden");
+    refreshTrustUI(false);
+  }
+  $("trustNowBtn").onclick = () => setTrust(true);
+  $("trustLaterBtn").onclick = () => setTrust(false);
+  $("trustPill").onclick = () => $("trustBanner").classList.remove("hidden");
+  $("setTrustBtn").onclick = () => setTrust(true);
+  async function refreshUpdateFlow() {
+    const row = $("setUpdFlowRow");
+    try {
+      const r = await fetch("/api/update/status");
+      const d = await r.json();
+      if (!d || d.mode !== "packaged") {
+        if (row) row.classList.add("hidden");
+        return;
+      }
+      if (row) row.classList.remove("hidden");
+      const out = $("setUpdFlowOut");
+      const dl = d.download || {};
+      let txt = "v" + d.current + ". ";
+      if (d.pendingApply)
+        txt += "Update v" + (d.staged ? d.staged.version : "") + " is staged: restart GhostIDE to apply it. ";
+      else if (d.staged)
+        txt += "v" + d.staged.version + " downloaded and verified, ready to apply on restart. ";
+      else if (dl.state === "downloading")
+        txt += "downloading v" + dl.version + "\u2026 " + Math.round(100 * (dl.done || 0) / (dl.total || 1)) + "% ";
+      else if (dl.state === "verifying")
+        txt += "verifying the download checksum\u2026 ";
+      else if (dl.state === "error")
+        txt += "last download failed: " + dl.error + " ";
+      else if (d.lastCheck && d.lastCheck.updateAvailable)
+        txt += "v" + d.lastCheck.latest + " is available. ";
+      else if (d.lastResult)
+        txt += "(" + d.lastResult + ") ";
+      else
+        txt += "No update staged. ";
+      if (d.backupAvailable)
+        txt += "A previous version is kept for rollback.";
+      out.textContent = txt;
+      $("setUpdApplyBtn").disabled = !d.staged || !!d.pendingApply;
+      $("setUpdRollbackBtn").disabled = !d.backupAvailable;
+      $("setUpdAutoChk").checked = !d.settings || d.settings.checkOnLaunch !== false;
+    } catch (e) {
+      if (row) row.classList.add("hidden");
+    }
+  }
+  $("setUpdDownloadBtn").onclick = async () => {
+    try {
+      await postJson("/api/update/download", {});
+    } catch (e) {
+    }
+    refreshUpdateFlow();
+    setTimeout(refreshUpdateFlow, 1500);
+    setTimeout(refreshUpdateFlow, 5e3);
+  };
+  $("setUpdApplyBtn").onclick = async () => {
+    try {
+      await postJson("/api/update/apply", {});
+      $("setUpdFlowOut").textContent = "Staged. Restart GhostIDE to apply the update.";
+    } catch (e) {
+    }
+    refreshUpdateFlow();
+  };
+  $("setUpdRollbackBtn").onclick = async () => {
+    try {
+      await postJson("/api/update/rollback", {});
+      $("setUpdFlowOut").textContent = "Rollback staged. Restart GhostIDE to go back.";
+    } catch (e) {
+    }
+    refreshUpdateFlow();
+  };
+  $("setUpdAutoChk").onchange = async (e) => {
+    try {
+      await postJson(
+        "/api/update/settings",
+        { checkOnLaunch: !!e.target.checked }
+      );
+    } catch (e2) {
+    }
+  };
+  setTimeout(
+    () => {
+      refreshTrustUI(true);
+      refreshUpdateFlow();
+    },
+    1200
+  );
   var modelDlTimer = null;
   async function refreshModelDl() {
     try {
@@ -36418,6 +36557,7 @@
     renderTabs();
     refreshWsLabel();
     loadFiles();
+    refreshTrustUI(true);
   }
   $("findBtn").onclick = () => $("findPanel").classList.toggle("hidden");
   $("findClose").onclick = () => $("findPanel").classList.add("hidden");

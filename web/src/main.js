@@ -1067,6 +1067,8 @@ $("settingsBtn").onclick = () => {
   $("settingsPanel").classList.toggle("hidden");
   refreshModelDl();
   refreshLlamaDl();
+  refreshTrustUI(false);
+  refreshUpdateFlow();
 };
 $("settingsClose").onclick = () =>
   $("settingsPanel").classList.add("hidden");
@@ -1152,6 +1154,154 @@ $("setUpdateBtn").onclick = async () => {
     out.textContent = "check failed (offline?)";
   }
 };
+
+/* ---------------- Desktop Cycle 1: workspace trust,
+   instructions, packaged updates ----------------
+   Trust: the server enforces it (agent actions, terminal
+   and MCP calls are refused while a folder is
+   untrusted); this UI only surfaces the decision. On the
+   phone these routes do not exist and everything here
+   quietly hides. */
+let trustState = null;
+async function refreshTrustUI(promptIfNeeded) {
+  try {
+    const r = await fetch("/api/trust");
+    const d = await r.json();
+    if (!d || typeof d.trusted !== "boolean") {
+      trustState = null;
+      $("trustPill").classList.add("hidden");
+      $("trustBanner").classList.add("hidden");
+      return;
+    }
+    trustState = d;
+    const pill = $("trustPill");
+    const banner = $("trustBanner");
+    if (d.trusted) {
+      pill.classList.add("hidden");
+      banner.classList.add("hidden");
+    } else {
+      pill.classList.remove("hidden");
+      if (promptIfNeeded && d.decision === null)
+        banner.classList.remove("hidden");
+    }
+    const info = $("setTrustInfo");
+    if (info) info.textContent = d.trusted
+      ? "trusted (agent, terminal and MCP tools are on)"
+      : "not trusted: agent actions, terminal and MCP "
+        + "tools are off for this folder";
+    const tbtn = $("setTrustBtn");
+    if (tbtn) tbtn.classList.toggle("hidden", !!d.trusted);
+  } catch (e) { /* desktop-only routes: stay hidden */ }
+  refreshInstrUI();
+}
+async function refreshInstrUI() {
+  try {
+    const r = await fetch("/api/instructions");
+    const d = await r.json();
+    const info = $("setInstrInfo");
+    if (!info) return;
+    if (d && d.files && d.files.length)
+      info.textContent = d.files.map(
+        (f) => f.rel + " (" + f.chars + " chars, in the "
+          + "agent's system context)").join(", ");
+    else
+      info.textContent = "none (no AGENTS.md in this "
+        + "workspace)";
+  } catch (e) { /* desktop-only route */ }
+}
+async function setTrust(trusted) {
+  try {
+    await postJson("/api/trust", { trusted });
+  } catch (e) {}
+  $("trustBanner").classList.add("hidden");
+  refreshTrustUI(false);
+}
+$("trustNowBtn").onclick = () => setTrust(true);
+$("trustLaterBtn").onclick = () => setTrust(false);
+$("trustPill").onclick = () =>
+  $("trustBanner").classList.remove("hidden");
+$("setTrustBtn").onclick = () => setTrust(true);
+
+/* Packaged-app update flow (D3): download, verify and
+   stage happen on the server; applying always waits for
+   a restart the user asks for. Report-only builds (and
+   the phone) hide the whole row. */
+async function refreshUpdateFlow() {
+  const row = $("setUpdFlowRow");
+  try {
+    const r = await fetch("/api/update/status");
+    const d = await r.json();
+    if (!d || d.mode !== "packaged") {
+      if (row) row.classList.add("hidden");
+      return;
+    }
+    if (row) row.classList.remove("hidden");
+    const out = $("setUpdFlowOut");
+    const dl = d.download || {};
+    let txt = "v" + d.current + ". ";
+    if (d.pendingApply)
+      txt += "Update v" + (d.staged ? d.staged.version : "")
+        + " is staged: restart GhostIDE to apply it. ";
+    else if (d.staged)
+      txt += "v" + d.staged.version + " downloaded and "
+        + "verified, ready to apply on restart. ";
+    else if (dl.state === "downloading")
+      txt += "downloading v" + dl.version + "… "
+        + Math.round(100 * (dl.done || 0) / (dl.total || 1))
+        + "% ";
+    else if (dl.state === "verifying")
+      txt += "verifying the download checksum… ";
+    else if (dl.state === "error")
+      txt += "last download failed: " + dl.error + " ";
+    else if (d.lastCheck && d.lastCheck.updateAvailable)
+      txt += "v" + d.lastCheck.latest + " is available. ";
+    else if (d.lastResult)
+      txt += "(" + d.lastResult + ") ";
+    else
+      txt += "No update staged. ";
+    if (d.backupAvailable)
+      txt += "A previous version is kept for rollback.";
+    out.textContent = txt;
+    $("setUpdApplyBtn").disabled = !d.staged || !!d.pendingApply;
+    $("setUpdRollbackBtn").disabled = !d.backupAvailable;
+    $("setUpdAutoChk").checked =
+      !d.settings || d.settings.checkOnLaunch !== false;
+  } catch (e) {
+    if (row) row.classList.add("hidden");
+  }
+}
+$("setUpdDownloadBtn").onclick = async () => {
+  try {
+    await postJson("/api/update/download", {});
+  } catch (e) {}
+  refreshUpdateFlow();
+  setTimeout(refreshUpdateFlow, 1500);
+  setTimeout(refreshUpdateFlow, 5000);
+};
+$("setUpdApplyBtn").onclick = async () => {
+  try {
+    await postJson("/api/update/apply", {});
+    $("setUpdFlowOut").textContent =
+      "Staged. Restart GhostIDE to apply the update.";
+  } catch (e) {}
+  refreshUpdateFlow();
+};
+$("setUpdRollbackBtn").onclick = async () => {
+  try {
+    await postJson("/api/update/rollback", {});
+    $("setUpdFlowOut").textContent =
+      "Rollback staged. Restart GhostIDE to go back.";
+  } catch (e) {}
+  refreshUpdateFlow();
+};
+$("setUpdAutoChk").onchange = async (e) => {
+  try {
+    await postJson("/api/update/settings",
+      { checkOnLaunch: !!e.target.checked });
+  } catch (e) {}
+};
+setTimeout(() => { refreshTrustUI(true); refreshUpdateFlow(); },
+  1200);
 
 let modelDlTimer = null;
 async function refreshModelDl() {
@@ -3782,6 +3932,7 @@ async function switchWorkspace(p) {
   renderTabs();
   refreshWsLabel();
   loadFiles();
+  refreshTrustUI(true);
 }
 
 /* Project find / replace (2.5) */

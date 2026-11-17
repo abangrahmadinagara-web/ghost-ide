@@ -2,8 +2,9 @@
 # GhostIDE one-command install (Linux).
 # From the unpacked package folder:  ./install.sh
 # Installs to ~/.local/share/ghostide with a launcher at
-# ~/.local/bin/ghostide and a desktop entry. No root, no
-# auto-updates: the app only ever CHECKS for updates.
+# ~/.local/bin/ghostide and a desktop entry. No root.
+# Updates are user-driven in the app: download, verify,
+# restart to apply, with rollback (never silent).
 set -euo pipefail
 SRC="$(cd "$(dirname "$0")" && pwd)"
 DEST="$HOME/.local/share/ghostide"

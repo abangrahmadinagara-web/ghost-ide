@@ -23,8 +23,8 @@ ck("A11 signer lineage is a build.sh constant, not luck",
    Cycle 7 batch 1 (branches), -> 141/131 in batch 2
    (stash), -> 144/134 in Cycle 8 batch 3 (tags GET,
    tag POST, amend POST), both servers each time. */
-ck("A12 route census recorded (146 desktop / 134 Java)",
-   (py.match(/parsed\.path ==/g) || []).length === 146 &&
+ck("A12 route census recorded (154 desktop / 134 Java; re-derived Desktop Cycle 1)",
+   (py.match(/parsed\.path ==/g) || []).length === 154 &&
    (java.match(/path\.equals\("\/api/g) || []).length === 134);
 ck("A13 name pins still refuse traversal shapes",
    py.includes('r"data-pack-[A-Za-z0-9_.-]+"') &&

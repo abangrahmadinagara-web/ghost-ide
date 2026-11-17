@@ -4,8 +4,8 @@
    "version": "1.0.6",
    "files": 37,
    "src_bytes": 829208,
-   "tests_passed": 948,
-   "tests_failed": 0
+   "tests_passed": 947,
+   "tests_failed": 1
   },
   "ghostindex": {
    "version": "0.1.0",

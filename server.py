@@ -28,8 +28,76 @@ WORKSPACE = Path(os.environ.get(
     "GHOST_IDE_WORKSPACE", ROOT / "playground")).resolve()
 PORT = int(os.environ.get("GHOST_IDE_PORT", "5173"))
 HOST = os.environ.get("GHOST_IDE_HOST", "127.0.0.1")
-APP_VERSION = "3.10.1"
+APP_VERSION = "3.11.0"
 FROZEN = getattr(sys, "frozen", False)
+
+# Desktop Cycle 1 (v3.11.0): portable mode, the desktop
+# updater and workspace trust live in sibling modules so
+# they can be unit-tested without the server. ghost_paths
+# is the one place that decides where app data lives:
+# ~/.ghostide by default, ghostide-data/ beside the app
+# in portable mode (--portable or GHOSTIDE_PORTABLE=1).
+if str(ROOT) not in sys.path:
+    # Sibling modules must resolve however the server was
+    # loaded: as a script (dir is sys.path[0] already),
+    # frozen, or imported by the probe suites.
+    sys.path.insert(0, str(ROOT))
+import ghost_paths
+import updater as _updater_mod
+import workspace_trust as _trust_mod
+
+PORTABLE = ghost_paths.portable_requested()
+APP_BASE = ghost_paths.app_base(ROOT, frozen=FROZEN)
+DATA_DIR = ghost_paths.data_dir(ROOT, frozen=FROZEN)
+UPDATE_MANIFEST_URL = os.environ.get(
+    "GHOST_IDE_UPDATE_MANIFEST",
+    _updater_mod.DEFAULT_MANIFEST_URL)
+
+TRUST_STORE = _trust_mod.TrustStore(
+    DATA_DIR / "trusted-workspaces.json")
+
+
+def workspace_trusted():
+    """D7: the open workspace's trust decision. Unknown
+    folders are untrusted until the user decides."""
+    return TRUST_STORE.is_trusted(WORKSPACE)
+
+
+# Routes that execute code or drive tools on the
+# workspace's behalf. While the workspace is untrusted
+# these are refused at the API layer (403), not merely
+# hidden in the UI: terminal, run/tests/debug/REPL, MCP
+# tool calls and prompts, and the agent's tool runners.
+TRUST_EXEC_ROUTES = frozenset({
+    "/api/terminal", "/api/terminal/reset",
+    "/api/run", "/api/tests/run",
+    "/api/debug/start", "/api/debug/cmd", "/api/repl",
+    "/api/mcp/call", "/api/mcp/prompt", "/api/mcp/restart",
+    "/api/eco/run", "/api/eco/toolrun",
+    "/api/ghostre/run", "/api/rea/run",
+    "/api/verify/run", "/api/refactor",
+})
+
+
+def _trust_denied(handler):
+    return handler.send_json(
+        {"error": "this workspace is not trusted yet: "
+                  "agent actions, terminal and MCP tools "
+                  "stay off until you trust the folder",
+         "code": "workspace-untrusted"}, status=403)
+
+
+_UPDATER = None
+
+
+def get_updater():
+    global _UPDATER
+    if _UPDATER is None:
+        _UPDATER = _updater_mod.Updater(
+            DATA_DIR, APP_VERSION,
+            app_dir=APP_BASE, frozen=FROZEN,
+            manifest_url=UPDATE_MANIFEST_URL)
+    return _UPDATER
 UPDATE_URL = os.environ.get(
     "GHOST_IDE_UPDATE_URL",
     "https://raw.githubusercontent.com/littlestjames82-sys"
@@ -129,7 +197,7 @@ import ssl as _ssl
 
 TLS_DIR = Path(os.environ.get(
     "GHOST_IDE_TLS_DIR",
-    Path.home() / ".ghostide" / "tls")).resolve()
+    DATA_DIR / "tls")).resolve()
 TLS_CERT = TLS_DIR / "host-cert.pem"
 TLS_KEY = TLS_DIR / "host-key.pem"
 TLS_META = TLS_DIR / "host-cert.json"
@@ -506,7 +574,7 @@ MODEL_CATALOG = {
     },
 }
 MODELS_DIR = Path(os.environ.get(
-    "GHOST_IDE_MODELS", Path.home() / ".ghostide" / "models"))
+    "GHOST_IDE_MODELS", DATA_DIR / "models"))
 
 
 def _find_llama():
@@ -514,7 +582,14 @@ def _find_llama():
     if env:
         return env
     name = "llama-server.exe" if os.name == "nt" else "llama-server"
-    for cand in (ROOT / "llama" / name,
+    # The fetched-runtime folder comes first (it is
+    # DATA_DIR/llama in portable mode, the app folder's
+    # llama/ otherwise; _llama_dir() is defined below, so
+    # the portable case is spelled out here).
+    fetched = (DATA_DIR / "llama" / name) if PORTABLE else \
+        ((ROOT.parent if FROZEN else ROOT) / "llama" / name)
+    for cand in (fetched,
+                 ROOT / "llama" / name,
                  ROOT.parent / "llama" / name):
         if cand.is_file():
             return str(cand)
@@ -589,7 +664,10 @@ def _llama_platform_key():
 def _llama_dir():
     """Where a fetched llama.cpp lands: the llama/ folder
     of the app folder (beside the executable when frozen,
-    the repo root in dev)."""
+    the repo root in dev). Portable mode keeps it inside
+    ghostide-data/ with the rest of the app data."""
+    if PORTABLE:
+        return DATA_DIR / "llama"
     base = ROOT.parent if FROZEN else ROOT
     return base / "llama"
 
@@ -3369,7 +3447,7 @@ def mcp_config_path():
     """Workspace .mcp.json / mcp.json first, then the user's
     ~/.ghostide/mcp.json (desktop only by nature)."""
     for cand in (WORKSPACE / ".mcp.json", WORKSPACE / "mcp.json",
-                 Path.home() / ".ghostide" / "mcp.json"):
+                 DATA_DIR / "mcp.json"):
         if cand.is_file():
             return cand
     return None
@@ -4756,6 +4834,9 @@ class Handler(SimpleHTTPRequestHandler):
             if not self._pair_gate(parsed.path):
                 return self.send_json(
                     {"error": "pairing required"}, status=401)
+            if parsed.path in TRUST_EXEC_ROUTES \
+                    and not workspace_trusted():
+                return _trust_denied(self)
             if parsed.path == "/api/pair/code":
                 return self._pair_code()
             if parsed.path == "/api/pair/certfp":
@@ -4769,6 +4850,8 @@ class Handler(SimpleHTTPRequestHandler):
                      "modelName": MODEL_NAME, "version": APP_VERSION,
                      "pairRequired": True,
                      "backupFormats": [1, 2],
+                     "portable": PORTABLE,
+                     "trusted": workspace_trusted(),
                      "workspace": str(WORKSPACE)})
             if parsed.path == "/api/eco/tools":
                 return self.send_json({"tools": eco_tools_state()})
@@ -5003,7 +5086,30 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json(
                     {"path": rel, "content": p.read_text(errors="replace")})
             if parsed.path == "/api/workspace":
-                return self.send_json({"workspace": str(WORKSPACE)})
+                return self.send_json({
+                    "workspace": str(WORKSPACE),
+                    "trusted": workspace_trusted(),
+                    "portable": PORTABLE})
+            if parsed.path == "/api/trust":
+                # D7: the open workspace's trust state.
+                return self.send_json({
+                    "workspace": str(WORKSPACE),
+                    "trusted": workspace_trusted(),
+                    "decision": TRUST_STORE.decision(WORKSPACE)})
+            if parsed.path == "/api/instructions":
+                # D7: which instruction files are in force
+                # for this workspace (AGENTS.md, with the
+                # .ghostide/AGENTS.md override).
+                files = _trust_mod.load_instructions(WORKSPACE)
+                return self.send_json({
+                    "workspace": str(WORKSPACE),
+                    "files": [{"rel": f["rel"],
+                               "chars": f["chars"]}
+                              for f in files]})
+            if parsed.path == "/api/update/status":
+                # D3: packaged-app update state (check,
+                # staged download, pending apply/rollback).
+                return self.send_json(get_updater().status())
             if parsed.path == "/api/update/check":
                 try:
                     req = urllib.request.Request(
@@ -5014,7 +5120,15 @@ class Handler(SimpleHTTPRequestHandler):
                                                 timeout=6) as r:
                         info = json.loads(
                             r.read().decode("utf-8"))
-                    latest = str(info.get("version", ""))
+                    # Desktop Cycle 1: VERSION.json is
+                    # per-platform now. The desktop train
+                    # ("desktop".version, falling back to
+                    # "version") is what this check follows;
+                    # "latest" stays the phone's train and
+                    # is not read here.
+                    latest = str((info.get("desktop") or {})
+                                 .get("version")
+                                 or info.get("version", ""))
 
                     def _tup(v):
                         out = []
@@ -5388,6 +5502,9 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json(
                     {"error": "view-only guest"},
                     status=403)
+            if parsed.path in TRUST_EXEC_ROUTES \
+                    and not workspace_trusted():
+                return _trust_denied(self)
             if parsed.path == "/api/pair/policy":
                 return self._pair_policy("POST")
             if parsed.path == "/api/pair/revoke":
@@ -5847,7 +5964,55 @@ class Handler(SimpleHTTPRequestHandler):
                 WORKSPACE = p
                 _term_kill()
                 _repl_kill()
-                return self.send_json({"ok": True, "workspace": str(p)})
+                return self.send_json({
+                    "ok": True, "workspace": str(p),
+                    "trusted": workspace_trusted()})
+            if parsed.path == "/api/trust":
+                # D7: trust is decided on the host, never
+                # by a pair guest.
+                if self.client_address[0] not in ("127.0.0.1",
+                                                  "::1"):
+                    return self.send_json(
+                        {"error": "trust is decided "
+                                  "on the host"}, status=403)
+                data = self.read_json()
+                TRUST_STORE.set(WORKSPACE,
+                                bool(data.get("trusted")),
+                                source="user")
+                return self.send_json({
+                    "ok": True, "workspace": str(WORKSPACE),
+                    "trusted": workspace_trusted()})
+            if parsed.path == "/api/update/download":
+                # D3: download + verify + stage in the
+                # background; the UI polls /api/update/status.
+                if not FROZEN:
+                    return self.send_json(
+                        {"error": "source runs are "
+                                  "report-only; updates apply "
+                                  "to the packaged app"},
+                        status=400)
+                get_updater().download_async()
+                return self.send_json(get_updater().status())
+            if parsed.path == "/api/update/apply":
+                try:
+                    return self.send_json(
+                        get_updater().mark_apply_pending())
+                except Exception as e:
+                    return self.send_json(
+                        {"error": str(e)}, status=400)
+            if parsed.path == "/api/update/rollback":
+                try:
+                    return self.send_json(
+                        get_updater().mark_rollback_pending())
+                except Exception as e:
+                    return self.send_json(
+                        {"error": str(e)}, status=400)
+            if parsed.path == "/api/update/settings":
+                data = self.read_json()
+                st = get_updater().set_settings(
+                    bool(data.get("checkOnLaunch", True)))
+                return self.send_json({"ok": True,
+                                       "settings": st})
             if parsed.path == "/api/context":
                 data = self.read_json()
                 if data.get("mode") == "smart":
@@ -7104,6 +7269,22 @@ class Handler(SimpleHTTPRequestHandler):
             if parsed.path == "/api/chat":
                 data = self.read_json()
                 data.setdefault("model", MODEL_NAME)
+                # D7: the workspace's AGENTS.md rides in
+                # the system context of every chat/agent
+                # request, whichever flow built it.
+                _instr = _trust_mod.instructions_block(WORKSPACE)
+                if _instr:
+                    _msgs = list(data.get("messages") or [])
+                    if _msgs and _msgs[0].get("role") == "system":
+                        _first = dict(_msgs[0])
+                        _first["content"] = (
+                            _first.get("content") or "") \
+                            + "\n\n" + _instr
+                        _msgs[0] = _first
+                    else:
+                        _msgs.insert(0, {"role": "system",
+                                         "content": _instr})
+                    data["messages"] = _msgs
                 return self.proxy("/v1/chat/completions", data, stream=True)
             if parsed.path == "/api/infill":
                 data = self.read_json()
@@ -7126,8 +7307,34 @@ class Handler(SimpleHTTPRequestHandler):
 
 def main():
     global WORKSPACE
-    if FROZEN and "GHOST_IDE_WORKSPACE" not in os.environ:
-        home_ws = Path.home() / "GhostIDE"
+    # D3: a staged update (or a rollback, or an
+    # auto-rollback of an unconfirmed boot) swaps the app
+    # folder before anything serves; when a swap happened,
+    # re-exec so the swapped build is what runs. A failed
+    # apply never blocks the current build from starting.
+    try:
+        _upd_action = get_updater().apply_at_launch()
+    except Exception as _upd_e:
+        _upd_action = None
+        print("update apply failed, continuing with the "
+              "current build: %s" % _upd_e)
+    if _upd_action:
+        print("update: %s - restarting into the swapped "
+              "build" % _upd_action)
+        if FROZEN:
+            os.execv(sys.executable,
+                     [sys.executable] + sys.argv[1:])
+        os.execv(sys.executable,
+                 [sys.executable] + sys.argv)
+    # The seeded first workspace: ~/GhostIDE for the
+    # packaged app, ghostide-data/workspace in portable
+    # mode (either run style), the repo playground for a
+    # plain source run (default_workspace returns None).
+    _seed_ws = ghost_paths.default_workspace(
+        ROOT, frozen=FROZEN)
+    if _seed_ws is not None \
+            and "GHOST_IDE_WORKSPACE" not in os.environ:
+        home_ws = _seed_ws
         if not home_ws.exists():
             home_ws.mkdir(parents=True, exist_ok=True)
             seed = ROOT / "playground"
@@ -7141,6 +7348,19 @@ def main():
                         _seed_sh.copy2(item, dst)
         WORKSPACE = home_ws
     WORKSPACE.mkdir(parents=True, exist_ok=True)
+    # D7: the folder the user launched in is trusted (it
+    # was their choice); folders opened later prompt once.
+    if TRUST_STORE.decision(WORKSPACE) is None:
+        TRUST_STORE.set(WORKSPACE, True, source="startup")
+    # D3: the packaged app checks for an update on launch
+    # when the setting allows it; the result waits in the
+    # updater state for the UI to show. Source runs stay
+    # report-only (the Settings check button).
+    if FROZEN and get_updater().settings()["checkOnLaunch"]:
+        import threading as _upd_threading
+        _upd_threading.Thread(
+            target=lambda: get_updater().run_check(),
+            daemon=True).start()
     # v2.33: an interrupted restore is rolled back
     # before the server serves anything.
     _restore_reconcile()
@@ -7195,6 +7415,13 @@ def main():
           "needs none.")
     print(f"Model: {MODEL_NAME} via {LLAMA_BASE} "
           f"({'up' if llama_health() else 'down - use Start Model in the IDE'})")
+    # D3: reaching the serve loop confirms the running
+    # build booted; an update swap that never gets here
+    # is rolled back by the next launch instead.
+    try:
+        get_updater().confirm_boot_ok()
+    except Exception:
+        pass
     for s in servers[:-1]:
         _threading.Thread(target=s.serve_forever,
                           daemon=True).start()
