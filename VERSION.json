@@ -1,1 +1,13 @@
-{"android":{"version":"3.10.1"},"desktop":{"manifest":"https://downloads.ghostdeveloperstudio.com/latest.json","version":"3.13.0"},"latest":"3.10.1","notes":"Desktop 3.13.0 (Desktop Cycle 2, D2): the agent trust layer - finished plans are also written to .ghostide/plans/ as editable files and acting on a plan re-reads the file; each agent run owns one checkpoint (.ghostide/checkpoints/) capturing pre-run originals lazily; a post-run review offers per-file and per-hunk keep/undo; every run leaves a record in .ghostide/agent-runs/. Desktop 3.12.0 added LSP (jedi-language-server for Python, typescript-language-server when Node.js is present). Desktop 3.11.0 added portable mode, packaged-app updates with rollback, AGENTS.md workspace instructions and workspace trust. Android stays 3.10.1; its next release re-syncs the shared version train.","url":"https://github.com/littlestjames82-sys/ghost-ide/releases","version":"3.13.0"}
+{
+ "android": {
+  "version": "3.10.1"
+ },
+ "desktop": {
+  "manifest": "https://downloads.ghostdeveloperstudio.com/latest.json",
+  "version": "3.14.0"
+ },
+ "latest": "3.10.1",
+ "notes": "Desktop 3.14.0 (Desktop Cycle 2, D8): MCP polish - per-tool enable and approval modes enforced server-side, static header auth with credentials kept in app data (never in a workspace file, never echoed back), OAuth 2.0 sign-in (authorization code + PKCE, dynamic registration, loopback callback, automatic refresh), a curated add-server catalog, paste-import of mcpServers configs with per-entry validation errors, and per-server status (connected / error / disabled / needs-auth) in the MCP panel. Desktop 3.13.0 added the agent trust layer (plan files, run checkpoints, per-file and per-hunk keep/undo, run records). Desktop 3.12.0 added LSP (jedi-language-server for Python, typescript-language-server when Node.js is present). Desktop 3.11.0 added portable mode, packaged-app updates with rollback, AGENTS.md workspace instructions and workspace trust. Android stays 3.10.1; its next release re-syncs the shared version train.",
+ "url": "https://github.com/littlestjames82-sys/ghost-ide/releases",
+ "version": "3.14.0"
+}

@@ -20,7 +20,10 @@ ck("desktop caches MCP lists keyed by config mtime, calls stay live",
    py.includes("_MCP_LIST_CACHE = {}") &&
    py.includes("def _mcp_list_cached(verb, server, argv)") &&
    py.includes('return _mcp_list_cached(') &&
-   py.includes("def mcp_call(server, tool, arguments):\n    return _mcp_cli("));
+   // D8: mcp_call gained the per-tool policy guard ahead
+   // of the same live (never cached) _mcp_cli call.
+   py.includes("def mcp_call(server, tool, arguments):") &&
+   py.includes('return _mcp_cli(["call", "--server", server,'));
 ck("eco info endpoint exists on both servers",
    py.includes('"/api/eco/info"') &&
    java.includes('"/api/eco/info"') &&

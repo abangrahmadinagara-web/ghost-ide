@@ -1,4 +1,4 @@
-// Desktop Cycle 2, D2 (v3.13.0): the agent trust
+// Desktop Cycle 2, D2 (v3.13.0; version checks made agreement-based in D8): the agent trust
 // layer. Static pins over the shipped sources, pure
 // function proofs (extracted between the AGENT2 and
 // RUNREVIEW markers), and a full HTTP end-to-end
@@ -25,14 +25,14 @@ let passed = 0, failed = 0;
 const ck = (n, c) => { console.log((c ? "PASS " : "FAIL ") + n); c ? passed++ : failed++; };
 
 /* ---------- static pins ---------- */
-ck("D2 version: desktop train at 3.13.0, phone train untouched",
-   py.includes('APP_VERSION = "3.13.0"') &&
-   vjson.desktop && vjson.desktop.version === "3.13.0" &&
-   vjson.version === "3.13.0" &&
+ck("D2 version: desktop train moved past 3.13.0 (D8: 3.14.0), phone train untouched",
+   vjson.desktop && vjson.desktop.version !== "3.10.1" &&
+   py.includes('APP_VERSION = "' + vjson.desktop.version + '"') &&
+   vjson.version === vjson.desktop.version &&
    vjson.latest === "3.10.1" &&
    vjson.android && vjson.android.version === "3.10.1");
 ck("D2 route census re-derived: 168 (166 + 2 run-record routes)",
-   (py.match(/parsed\.path ==/g) || []).length === 168);
+   (py.match(/parsed\.path ==/g) || []).length === 178);
 ck("D2 server: run records validated, capped, stored as data",
    py.includes('"/api/agent-runs"') &&
    py.includes("AGENT_RUN_MAX_BYTES = 256 * 1024") &&
@@ -195,7 +195,7 @@ try {
   }
   if (!up) throw new Error("server did not come up:\n" + serverLog);
   const health = await call("GET", "/api/health");
-  ck("E2E server reports 3.13.0", health.data.version === "3.13.0");
+  ck("E2E server reports the desktop version", health.data.version === vjson.desktop.version);
 
   /* 1. plan file: written, re-read, user edit wins */
   const planPath = F.planFilePath(new Date(2026, 10, 17, 1, 0, 0));

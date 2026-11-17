@@ -28,7 +28,7 @@ WORKSPACE = Path(os.environ.get(
     "GHOST_IDE_WORKSPACE", ROOT / "playground")).resolve()
 PORT = int(os.environ.get("GHOST_IDE_PORT", "5173"))
 HOST = os.environ.get("GHOST_IDE_HOST", "127.0.0.1")
-APP_VERSION = "3.13.0"
+APP_VERSION = "3.14.0"
 FROZEN = getattr(sys, "frozen", False)
 
 # Desktop Cycle 1 (v3.11.0): portable mode, the desktop
@@ -95,6 +95,19 @@ def _trust_denied(handler):
                   "agent actions, terminal and MCP tools "
                   "stay off until you trust the folder",
          "code": "workspace-untrusted"}, status=403)
+
+
+def _mcp_host_only(handler):
+    """D8: MCP policy/config/OAuth changes are settings
+    of the host machine (they can carry credentials), so
+    - exactly like POST /api/trust - pair guests may not
+    make them. Returns True when the caller may proceed."""
+    if handler.client_address[0] in ("127.0.0.1", "::1"):
+        return True
+    handler.send_json(
+        {"error": "MCP settings are changed on the host"},
+        status=403)
+    return False
 
 
 # Desktop Cycle 2, D2 (agent trust layer): run records.
@@ -3606,7 +3619,7 @@ def mcp_config_path():
 
 
 def _mcp_cli_oneshot(args, timeout=50):
-    cfg = mcp_config_path()
+    cfg = mcp_active_config_path()
     if cfg is None:
         raise ValueError("no MCP config found - add a "
                          ".mcp.json to the workspace")
@@ -3688,7 +3701,7 @@ class _McpDaemon:
     def request(self, req, timeout=50):
         import time as _time
         with self.lock:
-            cfg = mcp_config_path()
+            cfg = mcp_active_config_path()
             if cfg is None:
                 raise ValueError("no MCP config found - add "
                                  "a .mcp.json to the workspace")
@@ -3801,7 +3814,7 @@ _MCP_LIST_TTL = 300
 
 
 def _mcp_list_cached(verb, server, argv):
-    cfg = mcp_config_path()
+    cfg = mcp_active_config_path()
     try:
         mt = cfg.stat().st_mtime if cfg else 0
     except OSError:
@@ -3817,11 +3830,38 @@ def _mcp_list_cached(verb, server, argv):
 
 
 def mcp_tools(server):
-    return _mcp_list_cached(
+    out = _mcp_list_cached(
         "tools", server, ["tools", "--server", server])
+    # D8: every tool carries the workspace policy the
+    # panel renders and the agent briefing honors.
+    if isinstance(out, dict):
+        out = dict(out)
+        out["server_enabled"] = mcp_server_enabled(server)
+        tools = []
+        for t in out.get("tools") or []:
+            if isinstance(t, dict):
+                t = dict(t)
+                setting = mcp_tool_setting(
+                    server, str(t.get("name") or ""))
+                t["enabled"] = setting["enabled"]
+                t["approval"] = setting["approval"]
+            tools.append(t)
+        out["tools"] = tools
+    return out
 
 
 def mcp_call(server, tool, arguments):
+    # D8: the policy is enforced HERE, server-side, so
+    # the panel, the agent loop and the approve queue all
+    # hit the same refusal for a disabled server or tool.
+    if not mcp_server_enabled(server):
+        raise ValueError(
+            "MCP server '%s' is disabled in this workspace"
+            % server)
+    if not mcp_tool_setting(server, tool)["enabled"]:
+        raise ValueError(
+            "MCP tool '%s' on server '%s' is disabled in "
+            "this workspace" % (tool, server))
     return _mcp_cli(["call", "--server", server,
                      "--tool", tool,
                      "--args", json.dumps(arguments or {})])
@@ -3845,9 +3885,819 @@ def mcp_prompts(server):
 
 
 def mcp_prompt(server, name, arguments):
+    if not mcp_server_enabled(server):
+        raise ValueError(
+            "MCP server '%s' is disabled in this workspace"
+            % server)
     return _mcp_cli(["prompt", "--server", server,
                      "--name", name,
                      "--args", json.dumps(arguments or {})])
+
+
+# ---------------- MCP polish (Desktop Cycle 2, D8) -------
+# Per-tool control, HTTP auth (static headers + OAuth) and
+# managed config, layered over the GhostMCP client above.
+#
+# Storage, chosen to match what already exists:
+# - per-tool policy (enabled + approval mode) is a
+#   WORKSPACE setting: <workspace>/.ghostide/mcp-policy.json
+#   {"servers": {name: {"enabled": bool,
+#                       "tools": {tool: {"enabled": bool,
+#                                        "approval":
+#                                          "ask"|"allow"}}}}}
+# - static HTTP headers (credentials) NEVER live in a
+#   workspace or config file: they are split out into
+#   DATA_DIR/mcp-secrets.json (app data, portable-aware,
+#   mode 0600), keyed by server name, and merged into the
+#   config copy GhostMCP actually reads (the "effective
+#   config" below). No route ever returns a header value,
+#   only header names - the env names-not-values rule.
+# - OAuth tokens live in DATA_DIR/mcp-oauth.json (0600).
+#   OAuth itself runs entirely here in the IDE server;
+#   GhostMCP only ever sees the resulting Authorization
+#   header in the effective config.
+# The policy/config/oauth routes are settings, not
+# execution: like POST /api/trust they are host-only
+# (loopback), and deliberately NOT in TRUST_EXEC_ROUTES.
+# Enforcement of the policy is the opposite: mcp_call
+# itself refuses disabled servers/tools server-side, so
+# no client path (panel, agent, approve queue) can call
+# a tool the user turned off.
+
+def _mcp_write_json(path, obj, secret=False):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / (".%s.tmp-%d" % (path.name,
+                                        os.getpid()))
+    try:
+        tmp.write_text(json.dumps(obj, indent=1))
+        if secret:
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def _mcp_read_json(path, default):
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return default
+    return obj if isinstance(obj, type(default)) else default
+
+
+# -- per-tool policy --------------------------------------
+
+def mcp_policy_path():
+    return WORKSPACE / ".ghostide" / "mcp-policy.json"
+
+
+def mcp_policy_all():
+    raw = _mcp_read_json(mcp_policy_path(), {})
+    servers = raw.get("servers")
+    return servers if isinstance(servers, dict) else {}
+
+
+def mcp_server_enabled(server):
+    entry = mcp_policy_all().get(server)
+    if isinstance(entry, dict) and "enabled" in entry:
+        return bool(entry["enabled"])
+    return True
+
+
+def mcp_tool_setting(server, tool):
+    """{"enabled": bool, "approval": "ask"|"allow"} with
+    the defaults every unconfigured tool gets: enabled,
+    and always ask before the agent calls it."""
+    out = {"enabled": True, "approval": "ask"}
+    entry = mcp_policy_all().get(server)
+    if isinstance(entry, dict):
+        tools = entry.get("tools")
+        if isinstance(tools, dict):
+            mine = tools.get(tool)
+            if isinstance(mine, dict):
+                if "enabled" in mine:
+                    out["enabled"] = bool(mine["enabled"])
+                if mine.get("approval") in ("ask", "allow"):
+                    out["approval"] = mine["approval"]
+    return out
+
+
+def mcp_policy_view():
+    """The policy exactly as the panel and the agent read
+    it: every configured server with its server-level
+    switch and per-tool settings (defaults filled in)."""
+    servers = {}
+    for name, entry in mcp_policy_all().items():
+        if not isinstance(entry, dict):
+            continue
+        tools = {}
+        raw_tools = entry.get("tools")
+        if isinstance(raw_tools, dict):
+            for tool, mine in raw_tools.items():
+                if isinstance(mine, dict):
+                    tools[tool] = {
+                        "enabled": bool(mine.get(
+                            "enabled", True)),
+                        "approval": mine.get("approval")
+                        if mine.get("approval") in
+                        ("ask", "allow") else "ask"}
+        servers[name] = {
+            "enabled": bool(entry.get("enabled", True)),
+            "tools": tools}
+    return {"servers": servers}
+
+
+def mcp_policy_set(data):
+    server = str(data.get("server") or "").strip()
+    if not server:
+        raise ValueError("a policy change needs a server name")
+    all_policy = mcp_policy_all()
+    entry = all_policy.get(server)
+    if not isinstance(entry, dict):
+        entry = {}
+    if "server_enabled" in data:
+        entry["enabled"] = bool(data["server_enabled"])
+    tool = str(data.get("tool") or "").strip()
+    if tool:
+        tools = entry.get("tools")
+        if not isinstance(tools, dict):
+            tools = {}
+        mine = tools.get(tool)
+        if not isinstance(mine, dict):
+            mine = {}
+        if "enabled" in data:
+            mine["enabled"] = bool(data["enabled"])
+        if "approval" in data:
+            if data["approval"] not in ("ask", "allow"):
+                raise ValueError(
+                    "approval must be \"ask\" or \"allow\"")
+            mine["approval"] = data["approval"]
+        tools[tool] = mine
+        entry["tools"] = tools
+    all_policy[server] = entry
+    _mcp_write_json(mcp_policy_path(),
+                    {"servers": all_policy})
+    return mcp_policy_view()
+
+
+# -- secrets + OAuth token stores -------------------------
+
+def mcp_secrets_path():
+    return DATA_DIR / "mcp-secrets.json"
+
+
+def mcp_secrets_all():
+    raw = _mcp_read_json(mcp_secrets_path(), {})
+    return raw if isinstance(raw, dict) else {}
+
+
+def mcp_secret_headers(server):
+    mine = mcp_secrets_all().get(server)
+    if isinstance(mine, dict):
+        headers = mine.get("headers")
+        if isinstance(headers, dict):
+            return {str(k): str(v)
+                    for k, v in headers.items()}
+    return {}
+
+
+def mcp_oauth_path():
+    return DATA_DIR / "mcp-oauth.json"
+
+
+def mcp_oauth_all():
+    raw = _mcp_read_json(mcp_oauth_path(), {})
+    return raw if isinstance(raw, dict) else {}
+
+
+# -- the effective config ---------------------------------
+# GhostMCP reads one config file. When the user has stored
+# headers or OAuth tokens, the IDE writes a merged copy
+# into app data and points GhostMCP at that instead, so
+# credentials never touch the workspace config on disk.
+_MCP_EFFECTIVE = {"key": None, "path": None}
+
+
+def mcp_raw_config():
+    """(path, parsed mcpServers mapping) of the ACTIVE
+    config (workspace first, then the user config), or
+    (None, {}) when there is none."""
+    cfg = mcp_config_path()
+    if cfg is None:
+        return None, {}
+    data = _mcp_read_json(cfg, {})
+    servers = data.get("mcpServers")
+    return cfg, servers if isinstance(servers, dict) else {}
+
+
+def mcp_active_config_path():
+    """The config file GhostMCP should read right now:
+    the effective (merged) copy when secrets or OAuth
+    tokens apply, else the active config itself."""
+    cfg, servers = mcp_raw_config()
+    if cfg is None:
+        return None
+    secrets = mcp_secrets_all()
+    oauth = mcp_oauth_all()
+    applies = any(name in secrets or name in oauth
+                  for name in servers)
+    if not applies:
+        return cfg
+    try:
+        key = (cfg.stat().st_mtime,
+               mcp_secrets_path().stat().st_mtime
+               if mcp_secrets_path().is_file() else 0,
+               mcp_oauth_path().stat().st_mtime
+               if mcp_oauth_path().is_file() else 0)
+    except OSError:
+        key = None
+    stale = False
+    for name in servers:
+        rec = oauth.get(name)
+        if isinstance(rec, dict) and rec.get("expires_at") \
+                and float(rec["expires_at"]) < \
+                time.time() + 120:
+            stale = True  # rebuild so the token refreshes
+    if not stale and _MCP_EFFECTIVE["key"] == key and \
+            _MCP_EFFECTIVE["path"] is not None:
+        return _MCP_EFFECTIVE["path"]
+    merged = {}
+    for name, entry in servers.items():
+        if isinstance(entry, dict):
+            entry = dict(entry)
+            headers = {}
+            raw_h = entry.get("headers")
+            if isinstance(raw_h, dict):
+                headers.update({str(k): str(v)
+                                for k, v in raw_h.items()})
+            headers.update(mcp_secret_headers(name))
+            if mcp_entry_is_oauth(entry):
+                token = mcp_oauth_token_for(name, entry)
+                if token:
+                    headers["Authorization"] = \
+                        "Bearer " + token
+            if headers:
+                entry["headers"] = headers
+        merged[name] = entry
+    out = DATA_DIR / "mcp-effective.json"
+    _mcp_write_json(out, {"mcpServers": merged},
+                    secret=True)
+    _MCP_EFFECTIVE["key"] = key
+    _MCP_EFFECTIVE["path"] = out
+    return out
+
+
+def _mcp_drop_session(server):
+    try:
+        _MCP_DAEMON.request({"verb": "drop",
+                             "server": server}, timeout=5)
+    except Exception:
+        pass
+
+
+# -- managed config (the user config in app data) --------
+
+def mcp_user_config_path():
+    return DATA_DIR / "mcp.json"
+
+
+def mcp_entry_is_oauth(entry):
+    return bool(entry.get("oauth")) or \
+        entry.get("auth") == "oauth"
+
+
+def mcp_validate_entry(name, entry):
+    """A list of human-readable problems with one
+    mcpServers entry (empty list = valid). Shared by the
+    add/edit form and paste-import, so both reject the
+    same shapes."""
+    errs = []
+    if not name or not all(
+            c.isalnum() or c in "-_." for c in name):
+        errs.append("server name must be letters, digits, "
+                    "-, _ or .")
+    if not isinstance(entry, dict):
+        return errs + ["entry must be a JSON object"]
+    command = entry.get("command")
+    url = entry.get("url")
+    if command and url:
+        errs.append("give either a command (stdio) or a "
+                    "url (http), not both")
+    if not command and not url:
+        errs.append("needs a command (stdio) or a url (http)")
+    if command and not isinstance(command, str):
+        errs.append("command must be a string")
+    if url and not isinstance(url, str):
+        errs.append("url must be a string")
+    args = entry.get("args")
+    if args is not None and (
+            not isinstance(args, list)
+            or not all(isinstance(a, str) for a in args)):
+        errs.append("args must be a list of strings")
+    for key in ("env", "headers"):
+        val = entry.get(key)
+        if val is not None and (
+                not isinstance(val, dict) or not all(
+                    isinstance(k, str) and
+                    isinstance(v, str)
+                    for k, v in val.items())):
+            errs.append(key + " must be an object of "
+                        "string values")
+    return errs
+
+
+def mcp_redacted_servers(servers, secrets):
+    """Config entries as the client may see them: env and
+    header VALUES never leave the server, only names."""
+    out = []
+    for name in sorted(servers):
+        entry = servers[name]
+        if not isinstance(entry, dict):
+            continue
+        transport, target = "stdio", ""
+        if entry.get("url"):
+            transport, target = "http", str(entry["url"])
+        elif entry.get("command"):
+            target = " ".join(
+                [str(entry["command"])] +
+                [str(a) for a in (entry.get("args") or [])])
+        env = entry.get("env") or {}
+        headers = {}
+        raw_h = entry.get("headers")
+        if isinstance(raw_h, dict):
+            headers.update(raw_h)
+        headers.update(mcp_secret_headers(name))
+        out.append({
+            "name": name, "transport": transport,
+            "target": target,
+            "env_names": sorted(env) if isinstance(
+                env, dict) else [],
+            "header_names": sorted(headers),
+            "oauth": mcp_entry_is_oauth(entry),
+            "label": "Remote server" if transport == "http"
+                     else "Runs commands on this computer"})
+    return out
+
+
+def mcp_config_view():
+    active, _ = mcp_raw_config()
+    user_path = mcp_user_config_path()
+    user = _mcp_read_json(user_path, {})
+    user_servers = user.get("mcpServers")
+    if not isinstance(user_servers, dict):
+        user_servers = {}
+    secrets = mcp_secrets_all()
+    return {
+        "active_config": str(active) if active else None,
+        "active_is_user": bool(active) and
+        str(active) == str(user_path),
+        "user_config": str(user_path),
+        "servers": mcp_redacted_servers(user_servers,
+                                        secrets)}
+
+
+def _mcp_split_headers(entry):
+    """Copy of an entry with any headers removed; the
+    headers themselves (returned separately) belong in
+    the secrets store, never in a config file."""
+    entry = dict(entry)
+    headers = entry.pop("headers", None)
+    if isinstance(headers, dict):
+        return entry, {str(k): str(v)
+                       for k, v in headers.items()}
+    return entry, {}
+
+
+def mcp_save_user_server(name, entry):
+    errs = mcp_validate_entry(name, entry)
+    if errs:
+        raise ValueError("; ".join(errs))
+    entry, headers = _mcp_split_headers(entry)
+    user = _mcp_read_json(mcp_user_config_path(), {})
+    servers = user.get("mcpServers")
+    if not isinstance(servers, dict):
+        servers = {}
+    servers[name] = entry
+    user["mcpServers"] = servers
+    _mcp_write_json(mcp_user_config_path(), user)
+    secrets = mcp_secrets_all()
+    if headers:
+        secrets[name] = {"headers": headers}
+    else:
+        secrets.pop(name, None)
+    _mcp_write_json(mcp_secrets_path(), secrets,
+                    secret=True)
+    _mcp_drop_session(name)
+    return mcp_config_view()
+
+
+def mcp_delete_user_server(name):
+    user = _mcp_read_json(mcp_user_config_path(), {})
+    servers = user.get("mcpServers")
+    if isinstance(servers, dict):
+        servers.pop(name, None)
+        user["mcpServers"] = servers
+        _mcp_write_json(mcp_user_config_path(), user)
+    secrets = mcp_secrets_all()
+    if name in secrets:
+        secrets.pop(name)
+        _mcp_write_json(mcp_secrets_path(), secrets,
+                        secret=True)
+    oauth = mcp_oauth_all()
+    if name in oauth:
+        oauth.pop(name)
+        _mcp_write_json(mcp_oauth_path(), oauth,
+                        secret=True)
+    _mcp_drop_session(name)
+    return mcp_config_view()
+
+
+def mcp_import_config(text):
+    """Paste-import of an mcpServers-style config (the
+    Claude / Cursor shape). Valid entries merge into the
+    USER config; invalid ones are reported by name with
+    their problems - nothing fails silently."""
+    try:
+        data = json.loads(text)
+    except ValueError as e:
+        raise ValueError("that was not valid JSON: %s" % e)
+    if not isinstance(data, dict):
+        raise ValueError("the config must be a JSON object")
+    servers = data.get("mcpServers")
+    if not isinstance(servers, dict):
+        if all(isinstance(v, dict) for v in data.values()):
+            servers = data  # a bare name -> entry mapping
+        else:
+            raise ValueError(
+                'no "mcpServers" object in that config')
+    imported, errors = [], {}
+    for name, entry in servers.items():
+        errs = mcp_validate_entry(str(name), entry)
+        if errs:
+            errors[str(name)] = "; ".join(errs)
+            continue
+        mcp_save_user_server(str(name), entry)
+        imported.append(str(name))
+    return {"imported": imported, "errors": errors,
+            "config": mcp_config_view()}
+
+
+# -- curated catalog --------------------------------------
+# Only servers whose run commands are stated accurately:
+# the official reference servers on npm (run with npx)
+# and PyPI (run with uvx), plus GitHub's hosted server.
+# "{workspace}" in an arg is replaced with the open
+# workspace path when the catalog is served.
+MCP_CATALOG = [
+    {"id": "filesystem", "name": "Filesystem",
+     "blurb": "Read and write files under one folder "
+              "(the open workspace).",
+     "runtime": "Node.js (npx)",
+     "entry": {"command": "npx",
+               "args": ["-y",
+                        "@modelcontextprotocol/server-filesystem",
+                        "{workspace}"]}},
+    {"id": "memory", "name": "Memory",
+     "blurb": "A persistent knowledge graph the agent "
+              "can read and update.",
+     "runtime": "Node.js (npx)",
+     "entry": {"command": "npx",
+               "args": ["-y",
+                        "@modelcontextprotocol/server-memory"]}},
+    {"id": "fetch", "name": "Fetch",
+     "blurb": "Fetch web pages and convert them to "
+              "markdown for the agent.",
+     "runtime": "Python (uvx)",
+     "entry": {"command": "uvx",
+               "args": ["mcp-server-fetch"]}},
+    {"id": "sqlite", "name": "SQLite",
+     "blurb": "Query and update a SQLite database file "
+              "in the workspace.",
+     "runtime": "Python (uvx)",
+     "entry": {"command": "uvx",
+               "args": ["mcp-server-sqlite", "--db-path",
+                        "{workspace}/mcp-catalog.db"]}},
+    {"id": "github", "name": "GitHub (hosted)",
+     "blurb": "GitHub's official remote MCP server. "
+              "Needs a personal access token: after "
+              "adding, set the Authorization header to "
+              "\"Bearer \" plus your token.",
+     "runtime": "none (remote)",
+     "entry": {"url": "https://api.githubcopilot.com/mcp/"}},
+]
+
+
+def mcp_catalog():
+    out = []
+    for item in MCP_CATALOG:
+        entry = json.loads(json.dumps(item["entry"]))
+        if "args" in entry:
+            entry["args"] = [
+                a.replace("{workspace}", str(WORKSPACE))
+                for a in entry["args"]]
+        out.append({"id": item["id"], "name": item["name"],
+                    "blurb": item["blurb"],
+                    "runtime": item["runtime"],
+                    "entry": entry,
+                    "label": "Remote server"
+                    if "url" in entry else
+                    "Runs commands on this computer"})
+    return {"catalog": out}
+
+
+# -- OAuth 2.0 (authorization code + PKCE) ----------------
+# The flow lives entirely in this server: discovery via
+# the resource's well-known metadata, dynamic client
+# registration when the provider offers it, a PKCE
+# authorize redirect the user approves in their browser,
+# and a loopback callback route on this very server.
+# Tokens are stored in app data; refresh is automatic
+# when the effective config is rebuilt. A server whose
+# provider offers no registration endpoint cannot be
+# connected this way and says so plainly.
+_MCP_OAUTH_PENDING = {}
+
+
+def _oauth_fetch_json(url, data=None, form=False,
+                      timeout=15):
+    body = None
+    headers = {"Accept": "application/json"}
+    if data is not None:
+        if form:
+            body = urllib.parse.urlencode(data).encode()
+            headers["Content-Type"] = \
+                "application/x-www-form-urlencoded"
+        else:
+            body = json.dumps(data).encode()
+            headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=body,
+                                 headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def mcp_oauth_metadata(entry):
+    url = str(entry.get("url") or "")
+    parsed = urllib.parse.urlparse(url)
+    if not parsed.netloc:
+        raise ValueError("OAuth needs an http server url")
+    origin = "%s://%s" % (parsed.scheme, parsed.netloc)
+    resource = url
+    issuer = origin
+    try:
+        prm = _oauth_fetch_json(
+            origin + "/.well-known/oauth-protected-resource")
+        if isinstance(prm, dict):
+            resource = str(prm.get("resource") or url)
+            auth_servers = prm.get("authorization_servers")
+            if isinstance(auth_servers, list) and \
+                    auth_servers:
+                issuer = str(auth_servers[0]).rstrip("/")
+    except Exception:
+        pass  # fall back to the origin as its own issuer
+    meta = None
+    for suffix in ("/.well-known/oauth-authorization-server",
+                   "/.well-known/openid-configuration"):
+        try:
+            got = _oauth_fetch_json(issuer + suffix)
+            if isinstance(got, dict) and \
+                    got.get("authorization_endpoint") and \
+                    got.get("token_endpoint"):
+                meta = got
+                break
+        except Exception:
+            continue
+    if meta is None:
+        raise ValueError(
+            "no OAuth metadata found at %s - this server "
+            "may not support OAuth sign-in" % issuer)
+    return {"issuer": issuer, "resource": resource,
+            "authorization_endpoint":
+                str(meta["authorization_endpoint"]),
+            "token_endpoint": str(meta["token_endpoint"]),
+            "registration_endpoint":
+                str(meta.get("registration_endpoint") or "")}
+
+
+def mcp_oauth_redirect_uri():
+    return "http://127.0.0.1:%d/api/mcp/oauth/callback" \
+        % PORT
+
+
+def mcp_oauth_start(server):
+    _, servers = mcp_raw_config()
+    entry = servers.get(server)
+    if not isinstance(entry, dict) or not entry.get("url"):
+        raise ValueError(
+            "server '%s' is not an http server in the "
+            "config" % server)
+    meta = mcp_oauth_metadata(entry)
+    store = mcp_oauth_all()
+    rec = store.get(server)
+    if not isinstance(rec, dict):
+        rec = {}
+    client_id = rec.get("client_id")
+    if not client_id:
+        if not meta["registration_endpoint"]:
+            raise ValueError(
+                "this server does not offer dynamic client "
+                "registration, so GhostIDE cannot sign in "
+                "with OAuth. A static Authorization header "
+                "still works.")
+        reg = _oauth_fetch_json(
+            meta["registration_endpoint"], data={
+                "client_name": "GhostIDE",
+                "redirect_uris": [mcp_oauth_redirect_uri()],
+                "grant_types": ["authorization_code",
+                                "refresh_token"],
+                "response_types": ["code"],
+                "token_endpoint_auth_method": "none"})
+        client_id = reg.get("client_id")
+        if not client_id:
+            raise ValueError(
+                "client registration returned no client_id")
+        rec["client_id"] = client_id
+        store[server] = rec
+        _mcp_write_json(mcp_oauth_path(), store,
+                        secret=True)
+    state = _secrets.token_urlsafe(24)
+    verifier = _secrets.token_urlsafe(48)
+    challenge = _b64.urlsafe_b64encode(
+        _hashlib.sha256(verifier.encode()).digest()
+    ).decode().rstrip("=")
+    _MCP_OAUTH_PENDING[state] = {
+        "server": server, "verifier": verifier,
+        "token_endpoint": meta["token_endpoint"],
+        "client_id": client_id, "resource": meta["resource"],
+        "created": time.time()}
+    params = {
+        "response_type": "code", "client_id": client_id,
+        "redirect_uri": mcp_oauth_redirect_uri(),
+        "state": state, "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "resource": meta["resource"]}
+    scope = entry.get("oauth_scope")
+    if scope:
+        params["scope"] = str(scope)
+    return {"auth_url": meta["authorization_endpoint"]
+            + "?" + urllib.parse.urlencode(params),
+            "server": server}
+
+
+def mcp_oauth_exchange(state, code):
+    pending = _MCP_OAUTH_PENDING.pop(state, None)
+    if pending is None:
+        raise ValueError(
+            "that sign-in link is unknown or expired - "
+            "start the connection again from the MCP panel")
+    if time.time() - pending["created"] > 600:
+        raise ValueError(
+            "that sign-in took too long - start again")
+    tok = _oauth_fetch_json(
+        pending["token_endpoint"], form=True, data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": mcp_oauth_redirect_uri(),
+            "client_id": pending["client_id"],
+            "code_verifier": pending["verifier"],
+            "resource": pending["resource"]})
+    access = tok.get("access_token")
+    if not access:
+        raise ValueError(
+            "the token endpoint returned no access token")
+    store = mcp_oauth_all()
+    rec = store.get(pending["server"])
+    if not isinstance(rec, dict):
+        rec = {}
+    rec.update({
+        "client_id": pending["client_id"],
+        "access_token": access,
+        "refresh_token": tok.get("refresh_token")
+        or rec.get("refresh_token"),
+        "expires_at": time.time()
+        + float(tok.get("expires_in") or 3600),
+        "token_endpoint": pending["token_endpoint"],
+        "resource": pending["resource"]})
+    store[pending["server"]] = rec
+    _mcp_write_json(mcp_oauth_path(), store, secret=True)
+    _MCP_EFFECTIVE["key"] = None  # force a config rebuild
+    _mcp_drop_session(pending["server"])
+    return pending["server"]
+
+
+def mcp_oauth_refresh(server, rec):
+    tok = _oauth_fetch_json(
+        str(rec.get("token_endpoint") or ""), form=True,
+        data={"grant_type": "refresh_token",
+              "refresh_token": rec.get("refresh_token"),
+              "client_id": rec.get("client_id"),
+              "resource": rec.get("resource") or ""})
+    access = tok.get("access_token")
+    if not access:
+        raise ValueError("refresh returned no access token")
+    rec = dict(rec)
+    rec["access_token"] = access
+    if tok.get("refresh_token"):
+        rec["refresh_token"] = tok["refresh_token"]
+    rec["expires_at"] = time.time() + float(
+        tok.get("expires_in") or 3600)
+    store = mcp_oauth_all()
+    store[server] = rec
+    _mcp_write_json(mcp_oauth_path(), store, secret=True)
+    return access
+
+
+def mcp_oauth_token_for(server, entry):
+    """The stored access token for a server, refreshing
+    when expired; None when there is no usable token."""
+    rec = mcp_oauth_all().get(server)
+    if not isinstance(rec, dict) or \
+            not rec.get("access_token"):
+        return None
+    if float(rec.get("expires_at") or 0) > \
+            time.time() + 60:
+        return str(rec["access_token"])
+    if rec.get("refresh_token") and \
+            rec.get("token_endpoint"):
+        try:
+            return mcp_oauth_refresh(server, rec)
+        except Exception:
+            return None
+    return None
+
+
+def mcp_oauth_state(server):
+    """"connected" / "needs-auth" for an oauth server,
+    judged from the store alone (no network)."""
+    rec = mcp_oauth_all().get(server)
+    if not isinstance(rec, dict) or \
+            not rec.get("access_token"):
+        return "needs-auth"
+    if float(rec.get("expires_at") or 0) > time.time():
+        return "connected"
+    return "connected" if rec.get("refresh_token") \
+        else "needs-auth"
+
+
+# -- status ------------------------------------------------
+
+def mcp_status():
+    """Per-server honesty for the panel: transport label,
+    policy state, auth state, live session, tool count -
+    or the error that stopped the count."""
+    _, servers = mcp_raw_config()
+    live = {}
+    try:
+        out = _MCP_DAEMON.request({"verb": "sessions"},
+                                  timeout=10)
+        for s in out.get("sessions") or []:
+            live[s.get("server")] = s
+    except Exception:
+        pass
+    rows = []
+    described = {}
+    try:
+        for s in mcp_servers().get("servers") or []:
+            described[s.get("name")] = s
+    except Exception:
+        pass
+    for name in sorted(servers):
+        entry = servers[name]
+        if not isinstance(entry, dict):
+            continue
+        transport = "http" if entry.get("url") else "stdio"
+        row = {
+            "name": name, "transport": transport,
+            "target": described.get(name, {}).get(
+                "target", ""),
+            "label": "Remote server" if transport == "http"
+                     else "Runs commands on this computer",
+            "header_names": described.get(name, {}).get(
+                "header_names", []),
+            "live": name in live,
+            "calls": (live.get(name) or {}).get("calls", 0),
+            "tools": None, "error": None}
+        if not mcp_server_enabled(name):
+            row["status"] = "disabled"
+        elif mcp_entry_is_oauth(entry) and \
+                mcp_oauth_state(name) == "needs-auth":
+            row["status"] = "needs-auth"
+        else:
+            try:
+                tools = mcp_tools(name)
+                row["tools"] = len(tools.get("tools") or [])
+                row["status"] = "connected"
+            except ValueError as e:
+                row["status"] = "error"
+                row["error"] = str(e)[:300]
+        rows.append(row)
+    return {"servers": rows}
 
 
 # ---------------- GhostApprove queue (E10) ----------------
@@ -4972,6 +5822,48 @@ class Handler(SimpleHTTPRequestHandler):
             self.wfile.write(body)
         conn.close()
 
+    def _mcp_oauth_callback(self, parsed):
+        """D8: the loopback landing for an OAuth authorize
+        redirect. The state value is the credential here:
+        it was minted by /api/mcp/oauth/start on this
+        server and is single-use, so a stray browser hit
+        cannot connect anything."""
+        qs = urllib.parse.parse_qs(parsed.query)
+        code = (qs.get("code") or [""])[0]
+        state = (qs.get("state") or [""])[0]
+        err = (qs.get("error") or [""])[0]
+        if err:
+            title, msg = "Sign-in was not completed", \
+                "The provider reported: " + err
+        elif not code or not state:
+            title, msg = "Sign-in was not completed", \
+                "The callback arrived without a code."
+        else:
+            try:
+                server = mcp_oauth_exchange(state, code)
+                title = "Connected"
+                msg = ("The MCP server '" + server +
+                       "' is connected. You can close "
+                       "this tab and return to GhostIDE.")
+            except ValueError as e:
+                title, msg = "Sign-in failed", str(e)
+        def esc(s):
+            return (str(s).replace("&", "&amp;")
+                    .replace("<", "&lt;").replace(">", "&gt;"))
+        body = ("<!doctype html><meta charset=utf-8>"
+                "<title>GhostIDE MCP - " + esc(title) +
+                "</title><body style=\"font-family:"
+                "system-ui;background:#111;color:#eee;"
+                "padding:2rem\"><h1>" + esc(title) +
+                "</h1><p>" + esc(msg) + "</p></body>").encode()
+        self.send_response(200)
+        self.send_header("Content-Type",
+                         "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        return None
+
     # ---------- routes ----------
     def _pair_gate(self, path):
         if not path.startswith("/api/"):
@@ -5107,6 +5999,19 @@ class Handler(SimpleHTTPRequestHandler):
                     return self.send_json(mcp_servers())
                 except ValueError as e:
                     return self.send_json({"error": str(e)}, 400)
+            if parsed.path == "/api/mcp/policy":
+                return self.send_json(mcp_policy_view())
+            if parsed.path == "/api/mcp/config":
+                return self.send_json(mcp_config_view())
+            if parsed.path == "/api/mcp/catalog":
+                return self.send_json(mcp_catalog())
+            if parsed.path == "/api/mcp/status":
+                try:
+                    return self.send_json(mcp_status())
+                except ValueError as e:
+                    return self.send_json({"error": str(e)}, 400)
+            if parsed.path == "/api/mcp/oauth/callback":
+                return self._mcp_oauth_callback(parsed)
             if parsed.path == "/api/approve/list":
                 try:
                     return self.send_json(approve_list())
@@ -6831,6 +7736,55 @@ class Handler(SimpleHTTPRequestHandler):
                 # E9: GhostScope pack for the diff.
                 try:
                     return self.send_json(git_scope(WORKSPACE))
+                except ValueError as e:
+                    return self.send_json({"error": str(e)}, 400)
+            if parsed.path == "/api/mcp/policy":
+                if not _mcp_host_only(self):
+                    return None
+                data = self.read_json()
+                try:
+                    return self.send_json(mcp_policy_set(data))
+                except ValueError as e:
+                    return self.send_json({"error": str(e)}, 400)
+            if parsed.path == "/api/mcp/config/server":
+                if not _mcp_host_only(self):
+                    return None
+                data = self.read_json()
+                try:
+                    out = mcp_save_user_server(
+                        str(data.get("name") or ""),
+                        data.get("entry") or {})
+                    return self.send_json(out)
+                except ValueError as e:
+                    return self.send_json({"error": str(e)}, 400)
+            if parsed.path == "/api/mcp/config/delete":
+                if not _mcp_host_only(self):
+                    return None
+                data = self.read_json()
+                try:
+                    out = mcp_delete_user_server(
+                        str(data.get("name") or ""))
+                    return self.send_json(out)
+                except ValueError as e:
+                    return self.send_json({"error": str(e)}, 400)
+            if parsed.path == "/api/mcp/config/import":
+                if not _mcp_host_only(self):
+                    return None
+                data = self.read_json()
+                try:
+                    out = mcp_import_config(
+                        str(data.get("text") or ""))
+                    return self.send_json(out)
+                except ValueError as e:
+                    return self.send_json({"error": str(e)}, 400)
+            if parsed.path == "/api/mcp/oauth/start":
+                if not _mcp_host_only(self):
+                    return None
+                data = self.read_json()
+                try:
+                    out = mcp_oauth_start(
+                        str(data.get("server") or ""))
+                    return self.send_json(out)
                 except ValueError as e:
                     return self.send_json({"error": str(e)}, 400)
             if parsed.path == "/api/mcp/tools":

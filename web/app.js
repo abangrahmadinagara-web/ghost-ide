@@ -38023,6 +38023,13 @@
     }
     const box = $("todoResults");
     box.textContent = "";
+    const mcpStatus = {};
+    try {
+      const st = await (await fetch("/api/mcp/status")).json();
+      for (const r of st && st.servers || [])
+        mcpStatus[r.name] = r;
+    } catch (e) {
+    }
     const head = document.createElement("div");
     head.className = "dim";
     head.textContent = sd.error ? sd.error : !sd.config ? "No MCP config found. Add a .mcp.json to this workspace (standard mcpServers format) and MCP servers will appear here - and in the agent's briefing." : "Config: " + sd.config + " - " + (sd.servers || []).length + " server(s). Pick one to see its tools.";
@@ -38031,8 +38038,58 @@
       const row = document.createElement("div");
       row.className = "todorow";
       const label = document.createElement("span");
-      label.textContent = s.name + " - " + s.transport + " - " + s.target;
+      label.textContent = s.name + " - " + s.transport + " - " + s.target + " [" + (s.transport === "http" ? "Remote server" : "Runs commands on this computer") + "]";
       row.appendChild(label);
+      const stRow = mcpStatus[s.name];
+      if (stRow) {
+        const stSpan = document.createElement("span");
+        stSpan.className = "dim";
+        stSpan.textContent = "Status: " + stRow.status + (stRow.tools != null ? ", " + stRow.tools + " tool(s)" : "") + (stRow.error ? " - " + stRow.error : "");
+        row.appendChild(stSpan);
+        const tgl = document.createElement("button");
+        tgl.className = "ghostbtn";
+        tgl.textContent = stRow.status === "disabled" ? "Enable server" : "Disable server";
+        tgl.onclick = async () => {
+          tgl.disabled = true;
+          try {
+            await postJson(
+              "/api/mcp/policy",
+              {
+                server: s.name,
+                server_enabled: stRow.status === "disabled"
+              }
+            );
+            _mcpPolicyAt = 0;
+          } catch (e) {
+          }
+          openMcpPanel();
+        };
+        row.appendChild(tgl);
+        if (stRow.status === "needs-auth") {
+          const cn = document.createElement("button");
+          cn.className = "ghostbtn";
+          cn.textContent = "Connect (OAuth)";
+          cn.onclick = async () => {
+            cn.disabled = true;
+            cn.textContent = "Opening sign-in\u2026";
+            try {
+              const d = await postJson(
+                "/api/mcp/oauth/start",
+                { server: s.name }
+              );
+              if (d.error) {
+                cn.textContent = d.error;
+                return;
+              }
+              window.open(d.auth_url, "_blank");
+              cn.textContent = "Finish in the browser, then reopen this panel";
+            } catch (e) {
+              cn.textContent = "Connect failed";
+            }
+          };
+          row.appendChild(cn);
+        }
+      }
       const b = document.createElement("button");
       b.className = "ghostbtn";
       b.textContent = "Tools";
@@ -38084,9 +38141,65 @@
             const tl = document.createElement("span");
             tl.textContent = t2.name + (t2.description ? " - " + String(t2.description).slice(0, 120) : "");
             tr.appendChild(tl);
+            const ann = t2.annotations || {};
+            const hints = [];
+            if (ann.readOnlyHint) hints.push("read-only");
+            if (ann.destructiveHint)
+              hints.push("destructive");
+            if (ann.openWorldHint) hints.push("open-world");
+            if (hints.length) {
+              const hs = document.createElement("span");
+              hs.className = "dim";
+              hs.textContent = "(" + hints.join(", ") + ")";
+              tr.appendChild(hs);
+            }
+            const en = document.createElement("input");
+            en.type = "checkbox";
+            en.checked = t2.enabled !== false;
+            en.title = "Offer this tool to the agent";
+            en.onchange = async () => {
+              try {
+                await postJson(
+                  "/api/mcp/policy",
+                  {
+                    server: s.name,
+                    tool: t2.name,
+                    enabled: en.checked
+                  }
+                );
+                _mcpPolicyAt = 0;
+              } catch (e) {
+              }
+              openMcpPanel();
+            };
+            tr.appendChild(en);
+            const ap = document.createElement("select");
+            for (const mode of ["ask", "allow"]) {
+              const op = document.createElement("option");
+              op.value = mode;
+              op.textContent = mode === "ask" ? "always ask" : "allow in this workspace";
+              ap.appendChild(op);
+            }
+            ap.value = t2.approval === "allow" ? "allow" : "ask";
+            ap.onchange = async () => {
+              try {
+                await postJson(
+                  "/api/mcp/policy",
+                  {
+                    server: s.name,
+                    tool: t2.name,
+                    approval: ap.value
+                  }
+                );
+                _mcpPolicyAt = 0;
+              } catch (e) {
+              }
+            };
+            tr.appendChild(ap);
             const cb = document.createElement("button");
             cb.className = "ghostbtn";
             cb.textContent = "Call";
+            if (t2.enabled === false) cb.disabled = true;
             cb.onclick = async () => {
               const raw = prompt(t2.name + " - arguments as a JSON object:", "{}");
               if (raw === null) return;
@@ -38279,6 +38392,7 @@
       row.appendChild(pb);
       box.appendChild(row);
     }
+    renderMcpManage(box);
   }
   var toolMcpBtn = $("toolMcp");
   if (toolMcpBtn)
@@ -38305,6 +38419,239 @@
   var gitGhostScopeBtn = $("gitGhostScope");
   if (gitGhostScopeBtn)
     gitGhostScopeBtn.onclick = () => gitProofRun("/api/git/scope", gitGhostScopeBtn, "\u2026");
+  var _mcpPolicyCache = null;
+  var _mcpPolicyAt = 0;
+  async function mcpRunPolicy() {
+    if (_mcpPolicyCache && Date.now() - _mcpPolicyAt < 3e4)
+      return _mcpPolicyCache;
+    try {
+      const d = await (await fetch("/api/mcp/policy")).json();
+      _mcpPolicyCache = d && d.servers || {};
+    } catch (e) {
+      _mcpPolicyCache = {};
+    }
+    _mcpPolicyAt = Date.now();
+    return _mcpPolicyCache;
+  }
+  async function mcpRunRefusal(act) {
+    const pol = await mcpRunPolicy();
+    const srv = pol[act.server];
+    if (!srv) return null;
+    if (srv.enabled === false)
+      return "the MCP server '" + act.server + "' is disabled in this workspace.";
+    const tool = (srv.tools || {})[act.tool];
+    if (tool && tool.enabled === false)
+      return "the MCP tool '" + act.server + "." + act.tool + "' is disabled in this workspace.";
+    return null;
+  }
+  async function mcpRunAllowed(act) {
+    const pol = await mcpRunPolicy();
+    const srv = pol[act.server];
+    const tool = srv && (srv.tools || {})[act.tool];
+    return !!(tool && tool.approval === "allow");
+  }
+  function mcpManageRow(box) {
+    const row = document.createElement("div");
+    row.className = "todorow";
+    box.appendChild(row);
+    return row;
+  }
+  function mcpManageNote(box, text) {
+    const d = document.createElement("div");
+    d.className = "dim";
+    d.textContent = text;
+    box.appendChild(d);
+    return d;
+  }
+  async function renderMcpManage(box) {
+    const head = document.createElement("div");
+    head.className = "dim";
+    head.textContent = "Add and manage servers. Servers you add here live in your user config (app data), not in the workspace. Header values (tokens) are stored separately in app data and are never shown back here.";
+    box.appendChild(head);
+    let cfg = null;
+    try {
+      cfg = await (await fetch("/api/mcp/config")).json();
+    } catch (e) {
+    }
+    if (cfg && cfg.active_config && !cfg.active_is_user)
+      mcpManageNote(box, "Note: this workspace has its own MCP config (" + cfg.active_config + "), which takes precedence over your user config.");
+    try {
+      const cd = await (await fetch("/api/mcp/catalog")).json();
+      for (const item of cd && cd.catalog || []) {
+        const row = mcpManageRow(box);
+        const lab = document.createElement("span");
+        lab.textContent = item.name + " - " + item.blurb + " [" + item.label + "; needs " + item.runtime + "]";
+        row.appendChild(lab);
+        const add2 = document.createElement("button");
+        add2.className = "ghostbtn";
+        add2.textContent = "Add";
+        add2.onclick = async () => {
+          add2.disabled = true;
+          try {
+            const d = await postJson(
+              "/api/mcp/config/server",
+              { name: item.id, entry: item.entry }
+            );
+            add2.textContent = d.error || "Added";
+            if (!d.error) openMcpPanel();
+          } catch (e) {
+            add2.textContent = "Add failed";
+          }
+        };
+        row.appendChild(add2);
+      }
+    } catch (e) {
+    }
+    if (cfg) {
+      for (const s of cfg.servers || []) {
+        const row = mcpManageRow(box);
+        const lab = document.createElement("span");
+        lab.textContent = s.name + " (" + s.transport + ") [" + s.label + "]" + (s.header_names && s.header_names.length ? " headers: " + s.header_names.join(", ") : "") + (s.oauth ? " OAuth" : "");
+        row.appendChild(lab);
+        const del = document.createElement("button");
+        del.className = "ghostbtn";
+        del.textContent = "Remove";
+        del.onclick = async () => {
+          del.disabled = true;
+          try {
+            await postJson(
+              "/api/mcp/config/delete",
+              { name: s.name }
+            );
+          } catch (e) {
+          }
+          openMcpPanel();
+        };
+        row.appendChild(del);
+      }
+    }
+    const impNote = mcpManageNote(
+      box,
+      "Import: paste an mcpServers config (Claude / Cursor format). Invalid entries are reported, never silently dropped."
+    );
+    const ta = document.createElement("textarea");
+    ta.rows = 4;
+    ta.cols = 60;
+    ta.placeholder = '{"mcpServers": {...}}';
+    box.appendChild(ta);
+    const impRow = mcpManageRow(box);
+    const impBtn = document.createElement("button");
+    impBtn.className = "ghostbtn";
+    impBtn.textContent = "Import";
+    const impOut = document.createElement("span");
+    impBtn.onclick = async () => {
+      impBtn.disabled = true;
+      try {
+        const d = await postJson(
+          "/api/mcp/config/import",
+          { text: ta.value }
+        );
+        if (d.error) {
+          impOut.textContent = d.error;
+        } else {
+          const errs = Object.entries(d.errors || {}).map(([k, v]) => k + ": " + v).join("; ");
+          impOut.textContent = "Imported: " + ((d.imported || []).join(", ") || "none") + (errs ? ". Problems: " + errs : "");
+          if ((d.imported || []).length) openMcpPanel();
+        }
+      } catch (e) {
+        impOut.textContent = "Import failed";
+      }
+      impBtn.disabled = false;
+    };
+    impRow.appendChild(impBtn);
+    impRow.appendChild(impOut);
+    mcpManageNote(box, "Add your own server:");
+    const form = document.createElement("div");
+    box.appendChild(form);
+    const mk = (label, ph) => {
+      const row = mcpManageRow(form);
+      const l = document.createElement("span");
+      l.textContent = label;
+      row.appendChild(l);
+      const inp = document.createElement("input");
+      inp.type = "text";
+      if (ph) inp.placeholder = ph;
+      row.appendChild(inp);
+      return inp;
+    };
+    const fName = mk("Name", "my-server");
+    const fKind = document.createElement("select");
+    for (const [v, t2] of [
+      ["command", "Command (stdio)"],
+      ["url", "URL (http)"]
+    ]) {
+      const op = document.createElement("option");
+      op.value = v;
+      op.textContent = t2;
+      fKind.appendChild(op);
+    }
+    const kindRow = mcpManageRow(form);
+    const kindLab = document.createElement("span");
+    kindLab.textContent = "Type";
+    kindRow.appendChild(kindLab);
+    kindRow.appendChild(fKind);
+    const kindNote = mcpManageNote(
+      form,
+      "A command server runs commands on this computer. A URL server is a remote server."
+    );
+    const fCmd = mk("Command", "npx");
+    const fArgs = mk("Args (JSON list)", '["-y", "pkg"]');
+    const fUrl = mk("URL", "https://example.com/mcp");
+    const fHdrName = mk("Header name", "Authorization");
+    const fHdrVal = mk("Header value (token)", "Bearer ...");
+    fHdrVal.type = "password";
+    const oauthRow = mcpManageRow(form);
+    const fOauth = document.createElement("input");
+    fOauth.type = "checkbox";
+    oauthRow.appendChild(fOauth);
+    const oauthLab = document.createElement("span");
+    oauthLab.textContent = "Use OAuth sign-in (URL servers; connect from the server list after adding)";
+    oauthRow.appendChild(oauthLab);
+    const addRow = mcpManageRow(form);
+    const addBtn = document.createElement("button");
+    addBtn.className = "ghostbtn";
+    addBtn.textContent = "Add server";
+    const addOut = document.createElement("span");
+    addBtn.onclick = async () => {
+      const entry = {};
+      if (fKind.value === "url") {
+        entry.url = fUrl.value.trim();
+        if (fOauth.checked) entry.oauth = true;
+      } else {
+        entry.command = fCmd.value.trim();
+        const raw = fArgs.value.trim();
+        if (raw) {
+          try {
+            entry.args = JSON.parse(raw);
+          } catch (e) {
+            addOut.textContent = "Args must be a JSON list.";
+            return;
+          }
+        }
+      }
+      if (fHdrVal.value)
+        entry.headers = {
+          [fHdrName.value.trim() || "Authorization"]: fHdrVal.value
+        };
+      addBtn.disabled = true;
+      try {
+        const d = await postJson(
+          "/api/mcp/config/server",
+          { name: fName.value.trim(), entry }
+        );
+        if (d.error) addOut.textContent = d.error;
+        else {
+          addOut.textContent = "Added";
+          openMcpPanel();
+        }
+      } catch (e) {
+        addOut.textContent = "Add failed";
+      }
+      addBtn.disabled = false;
+    };
+    addRow.appendChild(addBtn);
+    addRow.appendChild(addOut);
+  }
   async function openApprovePanel() {
     hideTools();
     $("todoTitle").textContent = "Approve queue";
@@ -44738,7 +45085,7 @@
               "/api/mcp/tools",
               { server: s.name }
             );
-            for (const t2 of (td.tools || []).slice(0, 10))
+            for (const t2 of (td.tools || []).filter((x) => x.enabled !== false).slice(0, 10))
               lines.push("- MCP " + s.name + " " + t2.name + (t2.description ? " - " + String(t2.description).slice(0, 100) : ""));
           } catch (e) {
           }
@@ -45037,6 +45384,26 @@
           messages.push({
             role: "user",
             content: await agentToolText(act)
+          });
+        } else if (act._d8why = await mcpRunRefusal(act)) {
+          const why = act._d8why;
+          runApprovals.push({
+            kind: "mcp",
+            target: act.server + "." + act.tool,
+            verdict: "disabled"
+          });
+          addMsg("SYSTEM", "\u26D4 MCP call refused: " + act.server + "." + act.tool + " - " + why);
+          messages.push({ role: "user", content: "That MCP call was refused: " + why + " Do not retry it; find another way or finish with DONE." });
+        } else if (policy !== "queue" && await mcpRunAllowed(act)) {
+          runApprovals.push({
+            kind: "mcp",
+            target: act.server + "." + act.tool,
+            verdict: "allowed"
+          });
+          const t2 = await agentToolText(act);
+          messages.push({
+            role: "user",
+            content: t2 + "\nContinue."
           });
         } else if (policy === "queue") {
           const q = await postJson(

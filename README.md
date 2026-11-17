@@ -175,6 +175,33 @@ served ungated by design.
   processes, so they never start for an untrusted
   workspace, and they stop when the IDE does. Turn the
   whole thing off in Settings ("Language servers").
+- **MCP polish** (desktop, v3.14.0): the MCP panel
+  gives every server an honest status (connected,
+  error with the message, disabled, needs auth) with
+  its tool count, and every entry is labelled before
+  it ever connects: "Runs commands on this computer"
+  for stdio servers, "Remote server" for HTTP ones.
+  Each tool can be switched off (disabled tools are
+  not offered to the agent, and the server itself
+  refuses calls to them) and given an approval mode,
+  always ask or allow in this workspace, stored per
+  workspace in `.ghostide/mcp-policy.json`; server
+  hints (read-only, destructive, open-world) are shown
+  as badges when the server provides them. Adding a
+  server takes one click from a small built-in catalog
+  (filesystem, memory, fetch, sqlite, GitHub), a paste
+  of an `mcpServers` JSON config in the usual
+  Claude/Cursor shape with validation errors shown per
+  entry, or the manual form. HTTP servers can carry
+  static headers such as an Authorization token: the
+  values are stored in the app data folder (never in
+  a config file, never sent back to the panel after
+  saving; only header names are shown), and servers
+  that support it can instead connect with OAuth 2.0
+  (authorization code with PKCE, dynamic client
+  registration, tokens in app data, automatic refresh).
+  Servers that need a credential but have none report
+  "needs auth" rather than failing quietly.
 
 ## How it is proven
 
