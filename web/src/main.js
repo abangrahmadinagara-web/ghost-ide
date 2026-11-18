@@ -5,7 +5,8 @@ import { EditorState, StateEffect, StateField, Prec, Compartment,
   RangeSet, EditorSelection } from "@codemirror/state";
 import { basicSetup } from "codemirror";
 import { indentWithTab, toggleComment, copyLineDown, moveLineUp,
-  moveLineDown, deleteLine } from "@codemirror/commands";
+  moveLineDown, deleteLine, insertTab, undo, cursorCharLeft,
+  cursorCharRight } from "@codemirror/commands";
 import { javascript } from "@codemirror/lang-javascript";
 import { python } from "@codemirror/lang-python";
 import { html } from "@codemirror/lang-html";
@@ -18,7 +19,7 @@ import { go } from "@codemirror/lang-go";
 import { oneDark } from "@codemirror/theme-one-dark";
 import { openSearchPanel, selectNextOccurrence } from "@codemirror/search";
 import { lintGutter, setDiagnostics } from "@codemirror/lint";
-import { snippet, autocompletion } from "@codemirror/autocomplete";
+import { snippet, autocompletion, insertBracket } from "@codemirror/autocomplete";
 import { foldAll, unfoldAll, indentUnit, HighlightStyle,
   syntaxHighlighting, codeFolding, foldGutter,
   foldKeymap } from "@codemirror/language";
@@ -8930,6 +8931,170 @@ $("handFind").onclick = () => $("findBtn").click();
 $("handTools").onclick = () => $("toolsBtn").click();
 applyLang();
 applyAccess();
+
+/*@@SYMBOLROW@@*/
+/* Mobile Cycle 1 (M3): the slim symbol row. Phone
+   keyboards bury the characters code is made of, so
+   one slim row docks in the editor column (in flow,
+   never an overlay) at phone widths while the editor
+   holds focus. Restraint is the point: a single row,
+   sideways scrolling inside its own box, hidden the
+   moment the editor loses focus, one toggle to kill.
+   Config is plain data under its own storage key:
+   { enabled, keys } with keys an array of strings.
+   The names Tab, Undo, Left and Right are special;
+   every other entry is inserted literally. Per
+   language key sets are deliberately out of scope.
+   Bracket and quote keys route through insertBracket,
+   the very helper the editor's auto-close (basicSetup
+   closeBrackets) runs for typed input, so a pair
+   lands with the cursor inside and a closing key
+   steps over its auto-closed partner, exactly as if
+   the character had been typed. Plain dispatch never
+   reaches that input path, so it is only the fallback
+   for characters insertBracket does not claim. Tab,
+   Undo and the cursor keys call the same commands
+   the editor's own keymap binds. */
+const SYMBOL_ROW_KEY = "ghostide-symbolrow";
+const SYMBOL_SPECIALS = ["Tab", "Undo", "Left", "Right"];
+const SYMBOL_DEFAULT_KEYS = ["Tab", "(", ")", "{", "}", "[", "]",
+  ";", ":", "=", ".", ",", "/", "\"", "'",
+  "Undo", "Left", "Right"];
+const SYMBOL_LABELS = { Tab: "Tab", Undo: "↩",
+  Left: "←", Right: "→" };
+const SYMBOL_ARIA = { Tab: "Tab", Undo: "Undo",
+  Left: "Cursor left", Right: "Cursor right" };
+function symbolRowCleanKeys(arr) {
+  if (!Array.isArray(arr)) return null;
+  const keys = arr.filter((k) => typeof k === "string" &&
+    k.length >= 1 && k.length <= 12);
+  return keys.length ? keys : null;
+}
+function symbolRowConfig() {
+  let cfg = {};
+  try {
+    cfg = JSON.parse(
+      localStorage.getItem(SYMBOL_ROW_KEY) || "{}") || {};
+  } catch (e) { cfg = {}; }
+  return { enabled: cfg.enabled !== false,
+    keys: symbolRowCleanKeys(cfg.keys) ||
+      SYMBOL_DEFAULT_KEYS.slice() };
+}
+function saveSymbolRowConfig(cfg) {
+  try {
+    localStorage.setItem(SYMBOL_ROW_KEY, JSON.stringify({
+      enabled: !!cfg.enabled,
+      keys: symbolRowCleanKeys(cfg.keys) ||
+        SYMBOL_DEFAULT_KEYS.slice(),
+    }));
+  } catch (e) {}
+}
+function symbolRowParseField(text) {
+  return symbolRowCleanKeys(
+    String(text || "").split(/\s+/).filter(Boolean));
+}
+function symbolRowInsert(v, key) {
+  if (!v || typeof key !== "string" || !key) return false;
+  if (key === "Tab") return insertTab(v);
+  if (key === "Undo") return undo(v);
+  if (key === "Left") return cursorCharLeft(v);
+  if (key === "Right") return cursorCharRight(v);
+  if (key.length === 1) {
+    const tr = insertBracket(v.state, key);
+    if (tr) { v.dispatch(tr); return true; }
+  }
+  v.dispatch(v.state.replaceSelection(key));
+  return true;
+}
+try {
+  window.__ghostSymbolRow = { SYMBOL_ROW_KEY,
+    SYMBOL_SPECIALS, SYMBOL_DEFAULT_KEYS, symbolRowConfig,
+    saveSymbolRowConfig, symbolRowParseField,
+    symbolRowInsert };
+} catch (e) {}
+/*@@SYMBOLROW-END@@*/
+
+/* M3 wiring: build the row buttons from the stored
+   config, track editor focus, bind the Settings
+   controls. Buttons are built with DOM calls only,
+   the house rule the audits pin. Insertion rides
+   pointerdown with the event cancelled, so focus
+   never leaves the editor and the soft keyboard is
+   never dismissed by a row tap; the mousedown cancel
+   is a second guard for engines that move focus
+   there. The buttons are also kept out of the tab
+   order (tabIndex -1). */
+function renderSymbolRow() {
+  const row = $("symbolRow");
+  if (!row) return;
+  while (row.firstChild) row.removeChild(row.firstChild);
+  for (const key of symbolRowConfig().keys) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "symKey";
+    b.tabIndex = -1;
+    b.dataset.key = key;
+    b.textContent = SYMBOL_LABELS[key] || key;
+    b.setAttribute("aria-label", SYMBOL_ARIA[key] || key);
+    b.title = SYMBOL_ARIA[key] || ("Insert " + key);
+    row.appendChild(b);
+  }
+  updateSymbolRow();
+}
+function updateSymbolRow() {
+  const row = $("symbolRow");
+  if (!row) return;
+  row.classList.toggle("hidden",
+    !(symbolRowConfig().enabled && view.hasFocus));
+}
+function initSymbolRow() {
+  const row = $("symbolRow");
+  if (!row) return;
+  row.addEventListener("pointerdown", (e) => {
+    const b = e.target.closest("[data-key]");
+    if (!b) return;
+    e.preventDefault();
+    symbolRowInsert(view, b.dataset.key);
+    view.focus();
+  });
+  row.addEventListener("mousedown", (e) => {
+    if (e.target.closest("[data-key]")) e.preventDefault();
+  });
+  view.dom.addEventListener("focusin", updateSymbolRow);
+  view.dom.addEventListener("focusout", () =>
+    setTimeout(updateSymbolRow, 0));
+  const tgl = $("setSymbolRow");
+  if (tgl) {
+    tgl.checked = symbolRowConfig().enabled;
+    tgl.onchange = (e) => {
+      const cfg = symbolRowConfig();
+      cfg.enabled = e.target.checked;
+      saveSymbolRowConfig(cfg);
+      updateSymbolRow();
+    };
+  }
+  const fld = $("setSymbolKeys");
+  if (fld) {
+    fld.value = symbolRowConfig().keys.join(" ");
+    fld.onchange = (e) => {
+      const keys = symbolRowParseField(e.target.value);
+      const cfg = symbolRowConfig();
+      if (keys) { cfg.keys = keys; saveSymbolRowConfig(cfg); }
+      e.target.value = symbolRowConfig().keys.join(" ");
+      renderSymbolRow();
+    };
+  }
+  const rst = $("setSymbolKeysReset");
+  if (rst) rst.onclick = () => {
+    const cfg = symbolRowConfig();
+    cfg.keys = SYMBOL_DEFAULT_KEYS.slice();
+    saveSymbolRowConfig(cfg);
+    if (fld) fld.value = cfg.keys.join(" ");
+    renderSymbolRow();
+  };
+  renderSymbolRow();
+}
+initSymbolRow();
 
 $("setDelay").value = settings.infillDelay;
 $("setDelay").onchange = (e) => {
